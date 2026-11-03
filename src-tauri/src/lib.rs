@@ -1,4 +1,4 @@
-//! Backend for the blog writer.
+//! Backend for mdwriter.
 //!
 //! Drafts live in the app data dir (`drafts/<slug>/index.md` plus images).
 //! All git work happens in an app-owned clone (`repo/`), never in the user's
@@ -442,7 +442,7 @@ fn publish_blocking(
     refresh_prs(&state, &repo)?;
     let existing = state.prs.lock().unwrap().get(&branch).cloned();
     if existing.is_none() && main_posts(&repo)?.get(slug).is_some_and(|p| !p.ends_with("/index.md")) {
-        return Err(format!("{slug} is a single-file post on main; the writer only publishes folder posts"));
+        return Err(format!("{slug} is a single-file post on main; mdwriter only publishes folder posts"));
     }
     emit("sync", "done", String::new());
 

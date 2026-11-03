@@ -11,13 +11,13 @@ Needs Rust, the Tauri CLI (`cargo install tauri-cli`), pnpm, `git` with SSH acce
 ```sh
 pnpm install
 cargo tauri dev      # development, with hot reload
-cargo tauri build    # builds src-tauri/target/release/bundle/macos/Writer.app
+cargo tauri build    # builds src-tauri/target/release/bundle/macos/mdwriter.app
 ```
 
 ## How it works
 
-- **Drafts** live in `~/Library/Application Support/com.richardparayno.blogwriter/drafts/<slug>/index.md`, with dropped images copied beside them and referenced as `./name.png`. They save automatically as you type.
-- **Git work** happens in the app's own clone at `.../com.richardparayno.blogwriter/repo`, never in your own checkout of the blog.
+- **Drafts** live in `~/Library/Application Support/com.richardparayno.mdwriter/drafts/<slug>/index.md`, with dropped images copied beside them and referenced as `./name.png`. They save automatically as you type.
+- **Git work** happens in the app's own clone at `.../com.richardparayno.mdwriter/repo`, never in your own checkout of the blog.
 - **Publish as PR** fetches `origin`, creates `post/<slug>` from `origin/main`, copies the draft folder to `src/content/posts/<slug>/`, commits only that folder (`post: <slug>`), pushes, and runs `gh pr create`. If `post/<slug>` already has an open PR, the app pushes a new commit to that branch instead.
 - **Status** comes from `gh pr list` (open PRs by head branch) and `origin/main`:
   - Local draft: not on main and has no PR.

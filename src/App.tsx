@@ -235,7 +235,7 @@ export default function App() {
     const body = [
       doc.fm.description,
       "",
-      `Published from Writer. Only \`src/content/posts/${slug}/\` changes in this PR.`,
+      `Published from mdwriter. Only \`src/content/posts/${slug}/\` changes in this PR.`,
     ].join("\n");
     try {
       await api.publish(slug, doc.fm.title || slug, body.trim());
@@ -324,7 +324,7 @@ export default function App() {
       <main className="main">
         <header className="bar" data-tauri-drag-region>
           <span className="bar-title" data-tauri-drag-region>
-            {fm?.title || (summary ? "Untitled" : "Writer")}
+            {fm?.title || (summary ? "Untitled" : "mdwriter")}
           </span>
           <div className="bar-actions">
             {summary?.pr && (
@@ -462,7 +462,7 @@ function PublishButton({ summary, running, onClick }: { summary: PostSummary; ru
 function Steps({ run, slug, onClose }: { run: PublishRun; slug: string; onClose: () => void }) {
   const { update } = run;
   const text: Record<StepId, React.ReactNode> = {
-    sync: <>Fetch the latest <code>origin</code> into the writer's own clone</>,
+    sync: <>Fetch the latest <code>origin</code> into mdwriter's own clone</>,
     branch: update ? <>Check out <code>post/{slug}</code> from its PR</> : <>Create <code>post/{slug}</code> from <code>origin/main</code></>,
     commit: <>Commit only <code>src/content/posts/{slug}/</code>: <code>post: {slug}</code></>,
     push: <>Push <code>post/{slug}</code></>,

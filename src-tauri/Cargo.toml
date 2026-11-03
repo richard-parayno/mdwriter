@@ -1,10 +1,10 @@
 [package]
-name = "blog-writer"
+name = "mdwriter"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "blog_writer_lib"
+name = "mdwriter_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
