@@ -143,6 +143,8 @@ impl Proj {
 struct AppState {
     /// Serializes every operation on the app-owned clones.
     repo_lock: Mutex<()>,
+    /// Serializes changes to `settings.json`, so two settings commands can't undo each other's edit.
+    settings_lock: Mutex<()>,
     /// Per project id: PRs from the last `gh pr list` and when that sync finished. Read lazily from the
     /// project's `sync.json`, for instant loads.
     cache: Mutex<HashMap<String, SyncCache>>,
@@ -291,24 +293,28 @@ fn adopt_legacy(app: &AppHandle, p: &Project, force: bool) -> Result<(), String>
     Ok(())
 }
 
-/// Saved settings, or the defaults when none are saved yet. Settings from before projects become one project.
+/// Saved settings, or the defaults when none are saved yet.
 fn load_settings(app: &AppHandle) -> Result<Settings, String> {
-    let json = match fs::read_to_string(settings_path(app)?) {
-        Ok(json) => json,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Settings::default()),
-        Err(e) => return Err(e.to_string()),
-    };
-    let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("settings.json is invalid: {e}"))?;
-    let legacy = legacy_project(&value);
-    let mut s: Settings = serde_json::from_value(value).map_err(|e| format!("settings.json is invalid: {e}"))?;
-    if let Some(mut p) = legacy {
-        p.id = new_id(app, &s, &p.repo)?;
-        adopt_legacy(app, &p, true)?;
-        s.active_project = p.id.clone();
-        s.projects.push(p);
-        write_settings(app, &s)?;
+    match fs::read_to_string(settings_path(app)?) {
+        Ok(json) => serde_json::from_str(&json).map_err(|e| format!("settings.json is invalid: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(e) => Err(e.to_string()),
     }
-    Ok(s)
+}
+
+/// Turns settings from before projects into one project and moves its files into the project's folder.
+/// Runs once at launch, before any command. The id depends only on the settings, so a migration that
+/// stopped partway finishes into the same folder next time.
+fn migrate_settings(app: &AppHandle) -> Result<(), String> {
+    let Ok(json) = fs::read_to_string(settings_path(app)?) else { return Ok(()) };
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("settings.json is invalid: {e}"))?;
+    let Some(mut p) = legacy_project(&value) else { return Ok(()) };
+    let mut s: Settings = serde_json::from_value(value).map_err(|e| format!("settings.json is invalid: {e}"))?;
+    p.id = unique_id(&p.repo, |id| s.projects.iter().any(|q| q.id == id));
+    adopt_legacy(app, &p, true)?;
+    s.active_project = p.id.clone();
+    s.projects.push(p);
+    write_settings(app, &s)
 }
 
 fn write_settings(app: &AppHandle, s: &Settings) -> Result<(), String> {
@@ -366,11 +372,15 @@ fn validate_project(app: &AppHandle, mut p: Project, check_remote: bool) -> Resu
     Ok(p)
 }
 
-/// Clones the project's repository into its folder on first use.
+/// Clones the project's repository into its folder on first use. Symbolic links in the repository check
+/// out as plain files, so nothing mdwriter writes into the clone can follow one out of it.
 fn ensure_repo(pj: &Proj) -> Result<PathBuf, String> {
     let repo = pj.repo();
     if !repo.join(".git").exists() {
-        exec(&pj.dir, "git", &["clone", "--quiet", "--", &pj.remote(), "repo"])?;
+        exec(&pj.dir, "git", &["clone", "--quiet", "-c", "core.symlinks=false", "--", &pj.remote(), "repo"])?;
+    } else if !fs::read_to_string(repo.join(".git/config")).is_ok_and(|c| c.contains("symlinks = false")) {
+        // Clones made before this setting existed.
+        git(&repo, &["config", "core.symlinks", "false"])?;
     }
     Ok(repo)
 }
@@ -439,6 +449,11 @@ fn prs(app: &AppHandle, pj: &Proj) -> HashMap<String, PrInfo> {
 
 fn ctx<'a>(repo: &'a Path, p: &'a Project) -> sync::Ctx<'a> {
     sync::Ctx { repo, main: &p.branch, posts_dir: &p.posts_dir }
+}
+
+/// Runs `f` off the main thread, so a command that waits on a lock or the network doesn't freeze the window.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f).await.map_err(|e| e.to_string())?
 }
 
 /// Runs `f` off the main thread with the clones locked, after making sure the project's clone exists.
@@ -558,24 +573,28 @@ fn list_posts_blocking(app: &AppHandle, project_id: &str, fetch: bool) -> Result
 }
 
 #[tauri::command]
-fn create_draft(app: AppHandle, state: State<AppState>, project: String, slug: String, content: String) -> Result<(), String> {
-    let pj = self::project(&app, &project)?;
-    let dir = pj.draft(&slug)?;
-    if dir.exists() {
-        return Err(format!("A draft named {slug} already exists"));
-    }
-    let repo = pj.repo();
-    if repo.join(".git").exists() {
-        let _guard = state.repo_lock.lock().unwrap();
-        if base_posts(&repo, &pj)?.contains_key(&slug) {
-            return Err(format!("A post with the slug {slug} is already on {}", pj.branch));
+async fn create_draft(app: AppHandle, project: String, slug: String, content: String) -> Result<(), String> {
+    blocking(move || {
+        let pj = self::project(&app, &project)?;
+        let dir = pj.draft(&slug)?;
+        if dir.exists() {
+            return Err(format!("A draft named {slug} already exists"));
         }
-    }
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    write_atomic(&dir.join("index.md"), content.as_bytes())?;
-    sync::init_new(&dir)?;
-    backup_draft(&app, &pj, &slug);
-    Ok(())
+        let repo = pj.repo();
+        if repo.join(".git").exists() {
+            let state: State<AppState> = app.state();
+            let _guard = state.repo_lock.lock().unwrap();
+            if base_posts(&repo, &pj)?.contains_key(&slug) {
+                return Err(format!("A post with the slug {slug} is already on {}", pj.branch));
+            }
+        }
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        write_atomic(&dir.join("index.md"), content.as_bytes())?;
+        sync::init_new(&dir)?;
+        backup_draft(&app, &pj, &slug);
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -825,7 +844,9 @@ fn get_settings(app: AppHandle) -> Result<Settings, String> {
 /// by their own commands, so those parts of `settings` are ignored here.
 #[tauri::command]
 async fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
+        let state: State<AppState> = app.state();
+        let _guard = state.settings_lock.lock().unwrap();
         let incoming = validate_app(settings)?;
         let prev = load_settings(&app)?;
         let mut projects = prev.projects.clone();
@@ -841,15 +862,16 @@ async fn save_settings(app: AppHandle, settings: Settings) -> Result<Settings, S
         Ok(next)
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
 /// Checks the repository is reachable, adds it as a project and makes it the active one.
 #[tauri::command]
 async fn add_project(app: AppHandle, project: Project) -> Result<Settings, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let prev = load_settings(&app)?;
+    blocking(move || {
         let mut p = validate_project(&app, project, true)?;
+        let state: State<AppState> = app.state();
+        let _guard = state.settings_lock.lock().unwrap();
+        let prev = load_settings(&app)?;
         if let Some(dup) = prev.projects.iter().find(|q| q.repo == p.repo && q.branch == p.branch) {
             return Err(if dup.archived {
                 format!("{} ({}) is archived. Unarchive it instead.", dup.repo, dup.branch)
@@ -861,7 +883,6 @@ async fn add_project(app: AppHandle, project: Project) -> Result<Settings, Strin
         p.archived = false;
         {
             // A clone and drafts from before projects carry over to the project for the same repository.
-            let state: State<AppState> = app.state();
             let _guard = state.repo_lock.lock().unwrap();
             adopt_legacy(&app, &p, false)?;
         }
@@ -872,34 +893,43 @@ async fn add_project(app: AppHandle, project: Project) -> Result<Settings, Strin
         Ok(next)
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
 /// Makes a project the one the window shows on launch.
 #[tauri::command]
-fn switch_project(app: AppHandle, id: String) -> Result<Settings, String> {
-    let prev = load_settings(&app)?;
-    if !prev.projects.iter().any(|p| p.id == id && !p.archived) {
-        return Err(format!("No project named {id:?}"));
-    }
-    let next = Settings { active_project: id, ..prev.clone() };
-    store_settings(&app, &prev, &next)?;
-    Ok(next)
+async fn switch_project(app: AppHandle, id: String) -> Result<Settings, String> {
+    blocking(move || {
+        let state: State<AppState> = app.state();
+        let _guard = state.settings_lock.lock().unwrap();
+        let prev = load_settings(&app)?;
+        if !prev.projects.iter().any(|p| p.id == id && !p.archived) {
+            return Err(format!("No project named {id:?}"));
+        }
+        let next = Settings { active_project: id, ..prev.clone() };
+        store_settings(&app, &prev, &next)?;
+        Ok(next)
+    })
+    .await
 }
 
 /// Archives or unarchives a project. Archiving only hides it: its clone and drafts stay on disk.
 #[tauri::command]
-fn archive_project(app: AppHandle, id: String, archived: bool) -> Result<Settings, String> {
-    let prev = load_settings(&app)?;
-    let mut next = prev.clone();
-    let p = next.projects.iter_mut().find(|p| p.id == id).ok_or_else(|| format!("No project named {id:?}"))?;
-    p.archived = archived;
-    if !archived && next.active().is_none() {
-        next.active_project = id;
-    }
-    next.fix_active();
-    store_settings(&app, &prev, &next)?;
-    Ok(next)
+async fn archive_project(app: AppHandle, id: String, archived: bool) -> Result<Settings, String> {
+    blocking(move || {
+        let state: State<AppState> = app.state();
+        let _guard = state.settings_lock.lock().unwrap();
+        let prev = load_settings(&app)?;
+        let mut next = prev.clone();
+        let p = next.projects.iter_mut().find(|p| p.id == id).ok_or_else(|| format!("No project named {id:?}"))?;
+        p.archived = archived;
+        if !archived && next.active().is_none() {
+            next.active_project = id;
+        }
+        next.fix_active();
+        store_settings(&app, &prev, &next)?;
+        Ok(next)
+    })
+    .await
 }
 
 /// Saves settings that already passed validation. A project whose repository changed gets a fresh clone.
@@ -932,7 +962,7 @@ fn store_settings(app: &AppHandle, prev: &Settings, next: &Settings) -> Result<(
                     let pj = proj(app, p.clone())?;
                     let drafts = pj.drafts()?;
                     for slug in local_drafts(&drafts)? {
-                        mirror(&drafts.join(&slug), &backup_drafts(&dir, &p.id).join(&slug))?;
+                        mirror(&drafts.join(&slug), &backup_drafts(&dir, p).join(&slug))?;
                     }
                 }
             }
@@ -946,21 +976,33 @@ fn store_settings(app: &AppHandle, prev: &Settings, next: &Settings) -> Result<(
 // ---------- iCloud backup ----------
 
 /// `iCloud Drive/mdwriter`, when iCloud Drive is on. Writing there needs no entitlement; it is a normal folder.
-/// It holds `settings.json` and `projects/<id>/drafts/<slug>/`, like the app data dir.
+/// It holds `settings.json` and `projects/<backup_key>/drafts/<slug>/`.
 fn backup_dir() -> Option<PathBuf> {
     let icloud = PathBuf::from(std::env::var("HOME").ok()?).join("Library/Mobile Documents/com~apple~CloudDocs");
     icloud.is_dir().then(|| icloud.join("mdwriter"))
 }
 
-fn backup_drafts(dir: &Path, id: &str) -> PathBuf {
-    dir.join("projects").join(id).join("drafts")
+/// The project's folder name in the backup. Local ids differ between Macs (the same repository can be
+/// `blog` on one and `blog-2` on another), so the backup is keyed by repository and branch instead.
+fn backup_key(p: &Project) -> String {
+    let readable = unique_id(&format!("x/{}-{}", p.repo.replace('/', "-"), p.branch), |_| false);
+    // FNV-1a, so names that read the same after lowercasing (a/b-c and a-b/c) still get their own folder.
+    let hash = format!("{}@{}", p.repo.to_lowercase(), p.branch)
+        .bytes()
+        .fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    format!("{readable}-{:08x}", hash as u32)
+}
+
+fn backup_drafts(dir: &Path, p: &Project) -> PathBuf {
+    dir.join("projects").join(backup_key(p)).join("drafts")
 }
 
 fn local_drafts(drafts: &Path) -> Result<Vec<String>, String> {
     let mut slugs: Vec<String> = fs::read_dir(drafts)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().join("index.md").is_file())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| fs::symlink_metadata(e.path().join("index.md")).is_ok_and(|m| m.is_file()))
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|s| check_slug(s).is_ok())
         .collect();
@@ -970,7 +1012,12 @@ fn local_drafts(drafts: &Path) -> Result<Vec<String>, String> {
 
 /// Copies the files of a draft folder that are missing or older in `to`, never deleting any, and makes the
 /// sync state (`.base/` and `.mdwriter.json`) in `to` match `from` exactly, so a restored draft keeps its base.
+/// Both are `…/projects/<id>/drafts/<slug>`; a symbolic link anywhere from `projects` down is refused.
 fn mirror(from: &Path, to: &Path) -> Result<(), String> {
+    sync::refuse_links(from, 3)?;
+    sync::refuse_links(to, 3)?;
+    sync::refuse_links(&from.join(sync::META), 0)?;
+    sync::refuse_links(&to.join(sync::META), 0)?;
     fs::create_dir_all(to).map_err(|e| e.to_string())?;
     if from.join(sync::BASE).is_dir() {
         sync::replace_files(&from.join(sync::BASE), &to.join(sync::BASE))?;
@@ -1008,7 +1055,7 @@ fn backup_draft(app: &AppHandle, pj: &Proj, slug: &str) {
     }
     let result = (|| {
         let dir = backup_dir().ok_or_else(|| "iCloud Drive is not turned on for this Mac".to_string())?;
-        mirror(&pj.draft(slug)?, &backup_drafts(&dir, &pj.id).join(slug))
+        mirror(&pj.draft(slug)?, &backup_drafts(&dir, pj).join(slug))
     })();
     record_backup(app, result);
 }
@@ -1036,11 +1083,11 @@ fn backup_plan(app: &AppHandle, ours: &Settings, theirs: &Settings, dir: &Path) 
     let mut taken = ours.clone();
     let mut plan = Vec::new();
     for t in &theirs.projects {
-        // The id names a folder in the backup, which another Mac wrote; never follow one that isn't a plain name.
+        // Another Mac wrote these; skip an id that isn't a plain folder name.
         if check_slug(&t.id).is_err() {
             continue;
         }
-        let from = backup_drafts(dir, &t.id);
+        let from = backup_drafts(dir, t);
         match ours.projects.iter().find(|o| o.repo == t.repo && o.branch == t.branch) {
             Some(o) => plan.push((o.clone(), from, false)),
             None => {
@@ -1086,17 +1133,22 @@ fn backup_status(app: AppHandle, state: State<AppState>) -> Result<BackupStatus,
 /// applies its app-wide settings with backup on. Drafts and projects already on this Mac are never overwritten.
 #[tauri::command]
 async fn restore_backup(app: AppHandle) -> Result<Settings, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    blocking(move || {
+        let state: State<AppState> = app.state();
+        let _guard = state.settings_lock.lock().unwrap();
         let dir = backup_dir().ok_or_else(|| "iCloud Drive is not turned on for this Mac".to_string())?;
         let ours = load_settings(&app)?;
         let Some(theirs) = backup_settings(&dir) else { return Ok(ours) };
         let mut projects = ours.projects.clone();
-        for (p, from, new) in backup_plan(&app, &ours, &theirs, &dir)? {
-            let p = if new {
-                validate_project(&app, p, false).map_err(|e| format!("A backed-up project is invalid: {e}"))?
-            } else {
-                p
-            };
+        // Check every backed-up project before writing anything, so a bad one leaves no folders behind.
+        let plan = backup_plan(&app, &ours, &theirs, &dir)?
+            .into_iter()
+            .map(|(p, from, new)| {
+                let p = if new { validate_project(&app, p, false).map_err(|e| format!("A backed-up project is invalid: {e}"))? } else { p };
+                Ok((p, from, new))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for (p, from, new) in plan {
             let local = proj(&app, p.clone())?.drafts()?;
             if from.is_dir() {
                 for slug in local_drafts(&from)? {
@@ -1115,7 +1167,6 @@ async fn restore_backup(app: AppHandle) -> Result<Settings, String> {
         Ok(next)
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
 // ---------- site detection ----------
@@ -1171,6 +1222,12 @@ async fn detect_site(app: AppHandle, project: String, branch: String, posts_dir:
             .ok_or_else(|| format!("No astro.config file on {}, so this does not look like an Astro project", s.branch))?;
         found_in.push(config_name);
         let site = string_prop(&config, "site").ok_or("astro.config has no `site`, so the URL can't be worked out")?;
+        // `site` comes from the repository and ends up on curl's command line; take only a plain web URL.
+        if !(site.starts_with("https://") || site.starts_with("http://"))
+            || site.chars().any(|c| c.is_whitespace() || c.is_control() || "\"'<>`".contains(c))
+        {
+            return Err(format!("astro.config's `site` is not an http(s) URL: {site:?}"));
+        }
         let base = string_prop(&config, "base").unwrap_or_default();
         let trailing = string_prop(&config, "trailingSlash").unwrap_or_default();
         let format = config
@@ -1244,7 +1301,12 @@ async fn detect_site(app: AppHandle, project: String, branch: String, posts_dir:
         let (check, verified) = match published {
             Some((slug, _)) => {
                 let probe = url.replace("{slug}", &slug);
-                let code = exec(&repo, "curl", &["-sL", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10", &probe])
+                // -q skips ~/.curlrc; --proto keeps redirects on the web; --url so the URL is never an option.
+                let code = exec(
+                    &repo,
+                    "curl",
+                    &["-q", "-sL", "--proto", "=http,https", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10", "--url", &probe],
+                )
                     .unwrap_or_else(|_| "no response".into());
                 (format!("{probe} returned {code}"), code == "200")
             }
@@ -1278,6 +1340,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .setup(|app| {
+            if let Err(e) = migrate_settings(app.handle()) {
+                eprintln!("mdwriter: couldn't move old settings into a project: {e}");
+            }
             // The default Quit item terminates the app with no chance to save, so swap it for one that asks first.
             #[cfg(target_os = "macos")]
             {
@@ -1376,5 +1441,37 @@ mod tests {
         s.fix_active();
         assert_eq!(s.active_project, "");
         assert!(s.active().is_none());
+    }
+
+    #[test]
+    fn backup_folders_are_named_by_repository_and_branch_not_local_id() {
+        let p = |id: &str, repo: &str, branch: &str| Project { id: id.into(), repo: repo.into(), branch: branch.into(), ..Project::default() };
+        // The same project under different local ids shares a folder; different repositories never do.
+        assert_eq!(backup_key(&p("blog", "octo/blog", "main")), backup_key(&p("blog-2", "Octo/Blog", "main")));
+        assert_ne!(backup_key(&p("a", "a/b-c", "main")), backup_key(&p("a", "a-b/c", "main")));
+        assert_ne!(backup_key(&p("a", "octo/blog", "main")), backup_key(&p("a", "octo/blog", "next")));
+        assert!(check_slug(&backup_key(&p("a", "octo/blog", "feature/x"))).is_ok());
+    }
+
+    #[test]
+    fn mirror_refuses_a_backup_that_links_out_of_its_folder() {
+        let root = std::env::temp_dir().join(format!("mdwriter-mirror-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (from, to, outside) = (root.join("a/projects/p/drafts/s"), root.join("b/projects/p/drafts/s"), root.join("outside"));
+        fs::create_dir_all(from.join(sync::BASE)).unwrap();
+        fs::write(from.join("index.md"), "hi").unwrap();
+        fs::create_dir_all(&to).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "mine").unwrap();
+        // A `.base` in the backup pointing at another folder would have its files deleted by replace_files.
+        std::os::unix::fs::symlink(&outside, to.join(sync::BASE)).unwrap();
+        assert!(mirror(&from, &to).is_err());
+        assert_eq!(fs::read_to_string(outside.join("keep.txt")).unwrap(), "mine");
+        // A linked file in a draft is not copied either.
+        std::os::unix::fs::symlink(outside.join("keep.txt"), from.join("key.png")).unwrap();
+        let to2 = root.join("c/projects/p/drafts/s");
+        mirror(&from, &to2).unwrap();
+        assert!(!to2.join("key.png").exists() && to2.join("index.md").exists());
+        fs::remove_dir_all(&root).unwrap();
     }
 }

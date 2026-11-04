@@ -18,10 +18,12 @@ function ago(ms: number) {
 export function SettingsPage({
   settings,
   onSaved,
+  onArchive,
   onClose,
 }: {
   settings: Settings;
   onSaved: (s: Settings) => void;
+  onArchive: (id: string, archived: boolean) => Promise<void>;
   onClose: () => void;
 }) {
   const [form, setForm] = useState(settings);
@@ -78,7 +80,7 @@ export function SettingsPage({
   /** Archives or unarchives a project at once, apart from the form. */
   async function archive(id: string, value: boolean) {
     try {
-      onSaved(await api.archiveProject(id, value));
+      await onArchive(id, value);
     } catch (e) {
       setError(String(e));
     }
@@ -348,6 +350,8 @@ function Keybinds({ value, onChange }: { value: Record<string, string>; onChange
                 className="icon-btn"
                 title={a.key ? `Reset to ${display(a.key)}` : "Reset to none"}
                 onClick={() => {
+                  const taken = a.key && ACTIONS.find((b) => b.id !== a.id && keys[b.id] === a.key);
+                  if (taken) return setNote(`${display(a.key)} is now ${taken.label}. Change that one first.`);
                   const next = { ...value };
                   delete next[a.id];
                   onChange(next);

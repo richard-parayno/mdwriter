@@ -82,12 +82,25 @@ pub fn check_slug(slug: &str) -> Result<(), String> {
     }
 }
 
-/// The post's files in a folder: top-level, not hidden.
+/// Errors when `path` or one of its `levels` nearest parents is a symbolic link. Folders that hold drafts
+/// can get their contents from a repository or an iCloud backup, and following a link there would read or
+/// write files outside them.
+pub fn refuse_links(path: &Path, levels: usize) -> Result<(), String> {
+    for p in path.ancestors().take(levels + 1) {
+        if fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("{} is a symbolic link, which mdwriter doesn't follow", p.display()));
+        }
+    }
+    Ok(())
+}
+
+/// The post's files in a folder: top-level, not hidden, and not symbolic links.
 pub fn draft_files(dir: &Path) -> Result<Vec<String>, String> {
+    refuse_links(dir, 0)?;
     let mut names: Vec<String> = fs::read_dir(dir)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.file_name().to_string_lossy().to_string())
         .filter(|n| !n.starts_with('.'))
         .collect();
@@ -113,6 +126,7 @@ fn dir_files(repo: &Path, dir: &Path) -> Result<Files, String> {
 
 /// Makes `to` hold exactly the post files of `from`.
 pub fn replace_files(from: &Path, to: &Path) -> Result<(), String> {
+    refuse_links(to, 0)?;
     fs::create_dir_all(to).map_err(|e| e.to_string())?;
     let keep = draft_files(from)?;
     for name in draft_files(to)? {
@@ -127,18 +141,21 @@ pub fn replace_files(from: &Path, to: &Path) -> Result<(), String> {
 }
 
 /// Copies a whole folder, hidden entries and subfolders included, replacing `to`.
+/// Symbolic links inside are skipped.
 pub fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    refuse_links(from, 0)?;
+    refuse_links(to, 0)?;
     if to.exists() {
         fs::remove_dir_all(to).map_err(|e| e.to_string())?;
     }
     fs::create_dir_all(to).map_err(|e| e.to_string())?;
     for entry in fs::read_dir(from).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.is_dir() {
-            copy_tree(&path, &to.join(entry.file_name()))?;
-        } else {
-            fs::copy(&path, to.join(entry.file_name())).map_err(|e| e.to_string())?;
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        } else if kind.is_file() {
+            fs::copy(entry.path(), to.join(entry.file_name())).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -155,7 +172,12 @@ pub struct Meta {
 }
 
 pub fn read_meta(draft: &Path) -> Meta {
-    fs::read_to_string(draft.join(META)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    let mut meta: Meta = fs::read_to_string(draft.join(META)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    // The file can come from a backup; only a full hash ever reaches git as a revision.
+    if !meta.commit.as_deref().is_some_and(|c| matches!(c.len(), 40 | 64) && c.chars().all(|c| c.is_ascii_hexdigit())) {
+        meta.commit = None;
+    }
+    meta
 }
 
 fn write_meta(draft: &Path, meta: &Meta) -> Result<(), String> {
@@ -477,6 +499,10 @@ impl Ctx<'_> {
 
         let folder = format!("{}/{slug}", self.posts_dir);
         let file = format!("{}/{slug}.md", self.posts_dir);
+        // The clone checks out with core.symlinks off, but an older clone can still hold a committed link;
+        // writing through one would land outside the repository.
+        refuse_links(&repo.join(&folder), folder.matches('/').count())?;
+        refuse_links(&repo.join(&file), 0)?;
         let keep_file = matches!(remote, Some((Layout::File, _))) && local.len() == 1 && local.contains_key("index.md");
         if let Some((layout, files)) = &remote {
             match layout {
@@ -495,6 +521,7 @@ impl Ctx<'_> {
         } else {
             fs::create_dir_all(repo.join(&folder)).map_err(|e| e.to_string())?;
             for name in local.keys() {
+                refuse_links(&repo.join(&folder).join(name), 0)?;
                 fs::copy(draft.join(name), repo.join(&folder).join(name)).map_err(|e| e.to_string())?;
             }
             git(repo, &["add", "--all", "--", &folder])?;
@@ -922,5 +949,36 @@ mod tests {
         let sha = rev_sha(&w.root.join("app"), "origin/post/fresh").unwrap();
         let prs = HashMap::from([("post/fresh".to_string(), PrInfo { number: 1, url: String::new(), state: "MERGED".into(), head_oid: sha })]);
         assert_eq!(ctx.upstream("fresh", &read_meta(&draft), &prs), "origin/main");
+    }
+
+    #[test]
+    fn push_never_writes_through_a_symlink_committed_in_the_repo() {
+        let w = World::new("symlink");
+        let victim = w.root.join("victim.txt");
+        fs::write(&victim, "precious").unwrap();
+        // Someone commits a post whose image is a link out of the clone (evil → posts → content → src → app).
+        w.write_other("src/content/posts/evil/index.md", &numbered("evil"));
+        std::os::unix::fs::symlink("../../../../../victim.txt", w.other().join("src/content/posts/evil/x.png")).unwrap();
+        w.commit_other("main", "evil");
+        w.fetch();
+        let ctx = w.ctx();
+        ctx.start_from_main("evil", &w.draft("evil")).unwrap();
+        w.edit_line("evil", 3, "line 3 mine");
+
+        let err = ctx.push("evil", &w.draft("evil"), &no_prs()).unwrap_err();
+        assert!(err.contains("symbolic link"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious");
+    }
+
+    #[test]
+    fn a_commit_from_a_tampered_meta_file_never_reaches_git() {
+        let dir = std::env::temp_dir().join(format!("mdwriter-meta-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(META), r#"{"branch":null,"commit":"--output=/tmp/x"}"#).unwrap();
+        assert_eq!(read_meta(&dir).commit, None);
+        let sha = "a".repeat(40);
+        fs::write(dir.join(META), format!(r#"{{"branch":null,"commit":"{sha}"}}"#)).unwrap();
+        assert_eq!(read_meta(&dir).commit.as_deref(), Some(sha.as_str()));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

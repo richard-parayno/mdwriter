@@ -28,9 +28,13 @@ const CODE_KEYS: Record<string, string> = {
   ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right",
 };
 
-/** The shortcut a key press makes, or null for a bare modifier. Uses the physical key, so Shift+, stays ",". */
+/**
+ * The shortcut a key press makes, or null for a bare modifier. Letters and digits follow the keyboard
+ * layout (⌘K is the key labelled K); other keys use their position, so Shift+, stays "," and ⌥K stays "K".
+ */
 export function fromEvent(e: KeyboardEvent): string | null {
-  const key = /^Key([A-Z])$/.exec(e.code)?.[1] ?? /^Digit(\d)$/.exec(e.code)?.[1] ?? (/^F\d{1,2}$/.test(e.code) ? e.code : CODE_KEYS[e.code]);
+  const typed = /^[a-z0-9]$/i.test(e.key) ? e.key.toUpperCase() : undefined;
+  const key = typed ?? /^Key([A-Z])$/.exec(e.code)?.[1] ?? /^Digit(\d)$/.exec(e.code)?.[1] ?? (/^F\d{1,2}$/.test(e.code) ? e.code : CODE_KEYS[e.code]);
   if (!key) return null;
   const mods = [e.metaKey && "Mod", e.ctrlKey && "Ctrl", e.altKey && "Alt", e.shiftKey && "Shift"].filter(Boolean);
   return [...mods, key].join("+");

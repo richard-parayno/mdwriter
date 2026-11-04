@@ -194,11 +194,15 @@ export default function App() {
       setReview(null);
       setHistory([]);
       setSince((s) => (s && (s.rev === "base" || s.rev === "main") && p.local ? s : null));
-      setConflict(p.conflict ? await api.conflict(slug) : null);
+      // Another post or project may be selected while these load; then drop what they return.
+      const conflict = p.conflict ? await api.conflict(slug) : null;
       const raw = p.local ? await api.readDraft(slug) : p.content;
+      const files = p.local ? await api.postFiles(slug) : null;
+      if (selectedRef.current !== slug) return;
+      setConflict(conflict);
       setDoc(parsePost(raw));
       setDocRev((r) => r + 1);
-      setFiles(p.local ? await api.postFiles(slug) : null);
+      setFiles(files);
       setSaveState("saved");
     },
     [posts, flushSave],
@@ -428,6 +432,12 @@ export default function App() {
       setConflict(null);
       setReview(null);
       setSince(null);
+      setSinceText(null);
+      setHistory([]);
+      setFiles(null);
+      setCreating(false);
+      // Toast actions such as Undo act on the project they came from.
+      setToast(null);
       setLoaded(false);
     }
     const list = await refresh(false);
@@ -447,8 +457,15 @@ export default function App() {
     await showProject(next);
   }
 
+  /** Saves a pending edit first: once archived, the project refuses writes. */
+  async function archiveProject(id: string, archived: boolean) {
+    await flushSave();
+    await settingsSaved(await api.archiveProject(id, archived));
+  }
+
   async function switchProject(id: string) {
     if (id === projectRef.current) return;
+    if (busy) return setToast({ text: "Wait for the current action to finish before switching projects", tone: "error" });
     setShowSettings(false);
     try {
       await flushSave();
@@ -562,10 +579,13 @@ export default function App() {
   };
   const keysRef = useRef(keys);
   keysRef.current = keys;
+  const blockedRef = useRef(false);
+  blockedRef.current = !project || adding;
   useEffect(() => {
     // Capture phase, so the editor's own Mod-Shift-L and friends don't see these.
     const onKey = (e: KeyboardEvent) => {
-      if (recording.current) return;
+      // Not while a shortcut is being recorded, or behind setup, where the post they'd act on is hidden.
+      if (recording.current || blockedRef.current) return;
       const pressed = fromEvent(e);
       const action = pressed && (Object.keys(keysRef.current) as ActionId[]).find((a) => keysRef.current[a] === pressed);
       if (!action) return;
@@ -581,7 +601,7 @@ export default function App() {
 
   const main = () => {
     if (showSettings && settings)
-      return <SettingsPage key={JSON.stringify(settings)} settings={settings} onSaved={settingsSaved} onClose={() => setShowSettings(false)} />;
+      return <SettingsPage key={JSON.stringify(settings)} settings={settings} onSaved={settingsSaved} onArchive={archiveProject} onClose={() => setShowSettings(false)} />;
     if (!doc || !fm || !summary)
       return <div className="empty">{loaded ? `Select a post or create one${keys.newPost ? ` with ${display(keys.newPost)}` : ""}` : "Loading posts…"}</div>;
     if (conflict && summary.conflict && files)
