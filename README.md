@@ -6,6 +6,10 @@ It's built for people who already run their site from a git repository, with a b
 
 Built with Tauri v2, React and CodeMirror.
 
+![mdwriter editing a post with live preview and change markers](docs/screenshot.png)
+
+*A draft in live preview, with change markers since the last sync: a changed line in blue, an added line in green, and the changed `tags` field marked.*
+
 ## Architecture
 
 Everything you write stays on your Mac until you choose an action. The app works in its own clone of your repository, never in your checkout, and only talks to the remote through `git` and the GitHub CLI.
@@ -63,19 +67,40 @@ Three rules keep local and remote from overwriting each other:
 
 ## Requirements
 
-- macOS
-- Rust, the Tauri CLI (`cargo install tauri-cli`) and pnpm, to build it
+- macOS. Linux builds through Nix too (below), but iCloud backup is macOS only.
+- Rust, the Tauri CLI, Node and pnpm, to build it. `.tool-versions` pins them for [mise](https://mise.jdx.dev): run `mise install`.
 - `git` with SSH access to your repository on GitHub
 - The GitHub CLI, `gh`, logged in
 
 ## Run
 
 ```sh
+mise install         # Rust, Node, pnpm and tauri-cli at the pinned versions
 pnpm install
 cargo tauri dev      # development, with hot reload
 cargo tauri build    # builds src-tauri/target/release/bundle/macos/mdwriter.app
 pnpm release         # builds, installs to /Applications, and restarts mdwriter if it was open
 ```
+
+### NixOS
+
+`devenv.nix` is a development shell for x86_64 Linux with the GTK and WebKitGTK libraries Tauri needs: run `devenv shell`, then `pnpm install` and `cargo tauri dev`.
+
+`flake.nix` packages the app for x86_64-linux:
+
+```sh
+nix run github:richard-parayno/mdwriter
+nix profile install github:richard-parayno/mdwriter
+```
+
+In a NixOS configuration, add the flake as an input, then use its overlay:
+
+```nix
+nixpkgs.overlays = [ mdwriter.overlays.default ];
+environment.systemPackages = [ pkgs.mdwriter ];
+```
+
+The package puts `git`, `gh`, `curl` and `openssh` on the app's `PATH`. After changing JavaScript dependencies, update the `hash` in `nix/package.nix`: build once, and Nix prints the new one.
 
 ## Setup
 
@@ -132,5 +157,14 @@ Outside Astro, set the Post URL by hand. The frontmatter fields above are still 
 - **Edit** starts a draft from a post that's already on your branch.
 - **Review changes** shows the remote against your draft: what Push would send. **Change markers** (the picker in the footer) mark lines added, changed or removed since the last sync, since your branch, or since any commit of the post. Click a marker to see the old text and revert it.
 - **Backup**, when on, copies each draft and the settings to `iCloud Drive/mdwriter` as they save, in the same `projects/<id>/` layout. It never deletes anything there.
+
+## Security
+
+mdwriter treats the repository and the iCloud backup as untrusted input:
+
+- Clones check out symbolic links as plain files (`core.symlinks=false`), and Push, Pull and backup refuse to read or write through a link. A post can't make the app write outside its own folders.
+- Slugs, project ids, branches, revisions and folders are checked before they reach `git`. Detect site accepts only an `http(s)` `site` and passes it to `curl` with `--url` and `--proto =http,https`.
+- The webview has a content security policy, and can load local files only from draft and conflict folders.
+- Links open only `http`, `https`, `mailto` and `tel` URLs.
 
 The git logic is in `src-tauri/src/sync.rs`. Its tests run each guarantee against a local bare repository: `cargo test --lib` in `src-tauri/`.
