@@ -1,15 +1,17 @@
 //! Backend for mdwriter.
 //!
-//! Drafts live in the app data dir (`drafts/<slug>/index.md` plus images).
-//! All git work happens in an app-owned clone (`repo/`), never in the user's
-//! own checkout, so publishing cannot disturb whatever is checked out there.
+//! Drafts live in the app data dir (`drafts/<slug>/index.md` plus images). All git work happens in an
+//! app-owned clone (`repo/`), never in the user's own checkout. Every action that changes a draft or the
+//! remote is explicit (Pull, Push, Open PR); listing posts only reads. The git logic is in `sync.rs`.
+
+mod sync;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
+use sync::{check_slug, draft_files, exec, git, write_atomic, PrInfo};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "avif", "svg"];
@@ -29,6 +31,7 @@ struct Settings {
     editor_font_size: u32,
     /// Hide markdown syntax away from the cursor and show images inline.
     live_preview: bool,
+    line_numbers: bool,
     /// Copy drafts and settings to `iCloud Drive/mdwriter` as they save.
     backup: bool,
 }
@@ -42,6 +45,7 @@ impl Default for Settings {
             post_url: "https://richardparayno.com/blog/{slug}/".into(),
             editor_font_size: 14,
             live_preview: true,
+            line_numbers: true,
             backup: false,
         }
     }
@@ -60,36 +64,43 @@ impl Settings {
 struct AppState {
     /// Serializes every operation on the app-owned clone.
     repo_lock: Mutex<()>,
-    /// Open PRs by head branch, from the last `gh pr list`.
-    prs: Mutex<HashMap<String, Pr>>,
+    /// PRs from the last `gh pr list` and when that sync finished; kept in `sync.json` for instant loads.
+    cache: Mutex<SyncCache>,
     /// Unix time in ms of the last successful backup, and the last backup error.
     backup: Mutex<(Option<u64>, Option<String>)>,
 }
 
-#[derive(Clone, Serialize)]
-struct Pr {
-    number: u64,
-    url: String,
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncCache {
+    /// The latest PR for each head branch.
+    prs: HashMap<String, PrInfo>,
+    synced_at: Option<u64>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PostSummary {
     slug: String,
-    /// "draft" | "review" | "published" | "changed"
-    status: &'static str,
-    pr: Option<Pr>,
-    /// True when the post exists as a local draft the app can edit.
+    /// The post is a local draft the app can edit.
     local: bool,
-    /// True when the local draft differs from what is on its PR branch (or main).
-    dirty: bool,
     content: String,
+    /// Sync state of a local draft; None for posts that are only on the main branch.
+    sync: Option<sync::Status>,
+    /// The open PR for `post/<slug>`.
+    pr: Option<PrInfo>,
+    /// The post exists on the main branch.
+    on_main: bool,
+    /// A pull is waiting for its conflicts to be resolved.
+    conflict: bool,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PostList {
     posts: Vec<PostSummary>,
     warnings: Vec<String>,
+    synced_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -99,21 +110,10 @@ struct PostFiles {
     images: Vec<String>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PublishResult {
-    number: u64,
-    url: String,
-    created: bool,
-    pushed: bool,
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
-#[derive(Clone, Serialize)]
-struct Progress {
-    step: &'static str,
-    state: &'static str,
-    detail: String,
-}
 
 // ---------- paths and process helpers ----------
 
@@ -133,65 +133,13 @@ fn repo_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join("repo"))
 }
 
-fn check_slug(slug: &str) -> Result<(), String> {
-    let ok = !slug.is_empty()
-        && slug
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-        && !slug.starts_with('-');
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("Invalid slug: {slug:?}"))
-    }
-}
 
 fn draft_path(app: &AppHandle, slug: &str) -> Result<PathBuf, String> {
     check_slug(slug)?;
     Ok(drafts_dir(app)?.join(slug))
 }
 
-/// GUI apps launched from Finder get a minimal PATH; make sure git and gh resolve.
-fn command(program: &str, cwd: &Path) -> Command {
-    let mut cmd = Command::new(program);
-    let path = std::env::var("PATH").unwrap_or_default();
-    cmd.current_dir(cwd)
-        .env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{path}"))
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GH_PROMPT_DISABLED", "1");
-    cmd
-}
 
-fn exec(cwd: &Path, program: &str, args: &[&str]) -> Result<String, String> {
-    let out = command(program, cwd)
-        .args(args)
-        .output()
-        .map_err(|e| format!("Could not run {program}: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
-    } else {
-        Err(format!(
-            "`{program} {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    }
-}
-
-fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    exec(repo, "git", args)
-}
-
-/// Writes through a hidden temp file and a rename, so a crash mid-write leaves the old file whole.
-/// `draft_files` skips dot files, so the temp file is never published or backed up.
-fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
-    use std::io::Write;
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let tmp = path.with_file_name(format!(".{name}.tmp"));
-    let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
-    f.write_all(content.as_bytes()).and_then(|_| f.sync_all()).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, path).map_err(|e| e.to_string())
-}
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir(app)?.join("settings.json"))
@@ -254,29 +202,83 @@ fn ensure_repo(app: &AppHandle, s: &Settings) -> Result<PathBuf, String> {
     Ok(repo)
 }
 
-fn refresh_prs(state: &AppState, cwd: &Path, s: &Settings) -> Result<(), String> {
+/// Lists the repository's PRs with gh and records them and the sync time.
+fn refresh_prs(app: &AppHandle, cwd: &Path, s: &Settings) -> Result<(), String> {
     let json = exec(
         cwd,
         "gh",
         &[
-            "pr", "list", "--repo", &s.repo, "--state", "open", "--limit", "200", "--json",
-            "number,url,headRefName",
+            "pr", "list", "--repo", &s.repo, "--state", "all", "--limit", "200", "--json",
+            "number,url,headRefName,headRefOid,state",
         ],
     )?;
     let rows: Vec<serde_json::Value> = serde_json::from_str(&json).map_err(|e| e.to_string())?;
-    let mut map = HashMap::new();
+    let mut prs: HashMap<String, PrInfo> = HashMap::new();
     for row in rows {
-        if let (Some(head), Some(number), Some(url)) = (
+        let (Some(head), Some(number), Some(url), Some(state), Some(oid)) = (
             row["headRefName"].as_str(),
             row["number"].as_u64(),
             row["url"].as_str(),
-        ) {
-            map.insert(head.to_string(), Pr { number, url: url.to_string() });
+            row["state"].as_str(),
+            row["headRefOid"].as_str(),
+        ) else {
+            continue;
+        };
+        // Keep the newest PR per branch.
+        if prs.get(head).is_none_or(|p| p.number < number) {
+            let pr = PrInfo { number, url: url.into(), state: state.into(), head_oid: oid.into() };
+            prs.insert(head.to_string(), pr);
         }
     }
-    *state.prs.lock().unwrap() = map;
-    Ok(())
+    let state: State<AppState> = app.state();
+    let mut cache = state.cache.lock().unwrap();
+    *cache = SyncCache { prs, synced_at: Some(now_ms()) };
+    let json = serde_json::to_string(&*cache).map_err(|e| e.to_string())?;
+    write_atomic(&data_dir(app)?.join("sync.json"), json.as_bytes())
 }
+
+/// Fetches and lists PRs; what every Pull and Push starts with.
+fn sync_remote(app: &AppHandle, repo: &Path, s: &Settings) -> Result<(), String> {
+    git(repo, &["fetch", "--quiet", "--prune", "origin"])?;
+    refresh_prs(app, repo, s)
+}
+
+fn prs(app: &AppHandle) -> HashMap<String, PrInfo> {
+    app.state::<AppState>().cache.lock().unwrap().prs.clone()
+}
+
+fn ctx<'a>(repo: &'a Path, s: &'a Settings) -> sync::Ctx<'a> {
+    sync::Ctx { repo, main: &s.branch, posts_dir: &s.posts_dir }
+}
+
+/// Where a conflicted pull waits to be resolved.
+fn conflict_dir(app: &AppHandle, slug: &str) -> Result<PathBuf, String> {
+    check_slug(slug)?;
+    Ok(data_dir(app)?.join("conflicts").join(slug))
+}
+
+/// The draft as it was before the last pull, for Undo.
+fn undo_dir(app: &AppHandle, slug: &str) -> Result<PathBuf, String> {
+    check_slug(slug)?;
+    Ok(data_dir(app)?.join("undo").join(slug))
+}
+
+/// Runs `f` off the main thread with the clone locked, after loading settings and making sure the clone exists.
+async fn with_repo<T: Send + 'static>(
+    app: AppHandle,
+    f: impl FnOnce(&AppHandle, &Path, &Settings) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state: State<AppState> = app.state();
+        let _guard = state.repo_lock.lock().unwrap();
+        let s = load_settings(&app)?;
+        let repo = ensure_repo(&app, &s)?;
+        f(&app, &repo, &s)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 
 /// Maps `src/content/posts/foo.md` and `src/content/posts/foo/index.md` to `foo`,
 /// the same ID Astro's glob loader gives them.
@@ -295,54 +297,12 @@ fn base_posts(repo: &Path, s: &Settings) -> Result<HashMap<String, String>, Stri
         .collect())
 }
 
-fn draft_files(dir: &Path) -> Result<Vec<String>, String> {
-    let mut names: Vec<String> = fs::read_dir(dir)
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| !n.starts_with('.'))
-        .collect();
-    names.sort();
-    Ok(names)
-}
 
-/// Whether the draft folder differs from `<rev>:src/content/posts/<slug>/`.
-fn differs_from(repo: &Path, rev: &str, posts_dir: &str, slug: &str, dir: &Path) -> Result<bool, String> {
-    let prefix = format!("{posts_dir}/{slug}/");
-    let tree = git(repo, &["ls-tree", "-r", rev, "--", &prefix])?;
-    let remote: HashMap<String, String> = tree
-        .lines()
-        .filter_map(|line| {
-            let (meta, path) = line.split_once('\t')?;
-            let hash = meta.split_whitespace().nth(2)?;
-            Some((path.strip_prefix(&prefix)?.to_string(), hash.to_string()))
-        })
-        .collect();
-    let files = draft_files(dir)?;
-    if files.len() != remote.len() {
-        return Ok(true);
-    }
-    let paths: Vec<String> = files.iter().map(|f| dir.join(f).to_string_lossy().to_string()).collect();
-    let mut args = vec!["hash-object"];
-    args.extend(paths.iter().map(String::as_str));
-    let hashes = git(repo, &args)?;
-    Ok(files
-        .iter()
-        .zip(hashes.lines())
-        .any(|(name, hash)| remote.get(name).map(String::as_str) != Some(hash)))
-}
-
-fn copy_dir(from: &Path, to: &Path) -> Result<(), String> {
-    fs::create_dir_all(to).map_err(|e| e.to_string())?;
-    for name in draft_files(from)? {
-        fs::copy(from.join(&name), to.join(&name)).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
 
 // ---------- commands ----------
 
+/// Lists drafts and posts. Without `fetch` this reads only local state, so it returns at once; with it,
+/// it fetches and lists PRs first. Either way it never changes a draft or the remote.
 #[tauri::command]
 async fn list_posts(app: AppHandle, fetch: bool) -> Result<PostList, String> {
     tauri::async_runtime::spawn_blocking(move || list_posts_blocking(&app, fetch))
@@ -363,14 +323,9 @@ fn list_posts_blocking(app: &AppHandle, fetch: bool) -> Result<PostList, String>
             None
         }
     };
-    if fetch {
-        if let Some(repo) = &repo {
-            if let Err(e) = git(repo, &["fetch", "--quiet", "--prune", "origin"]) {
-                warnings.push(e);
-            }
-            if let Err(e) = refresh_prs(&state, repo, &s) {
-                warnings.push(e);
-            }
+    if let (true, Some(repo)) = (fetch, &repo) {
+        if let Err(e) = sync_remote(app, repo, &s) {
+            warnings.push(e);
         }
     }
     let on_main = match &repo {
@@ -380,60 +335,50 @@ fn list_posts_blocking(app: &AppHandle, fetch: bool) -> Result<PostList, String>
         }),
         None => HashMap::new(),
     };
-    let prs = state.prs.lock().unwrap().clone();
+    let (prs, synced_at) = {
+        let cache = state.cache.lock().unwrap();
+        (cache.prs.clone(), cache.synced_at)
+    };
+    let open_pr = |slug: &str| prs.get(&format!("post/{slug}")).filter(|p| p.state == "OPEN").cloned();
 
     let drafts = drafts_dir(app)?;
-    let mut local: Vec<String> = fs::read_dir(&drafts)
-        .map_err(|e| e.to_string())?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().join("index.md").is_file())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
-    local.sort();
+    let local = local_drafts(&drafts)?;
     let local_set: HashSet<&String> = local.iter().collect();
-
     let mut posts = Vec::new();
     for slug in &local {
         let dir = drafts.join(slug);
-        let content = fs::read_to_string(dir.join("index.md")).unwrap_or_default();
-        let pr = prs.get(&format!("post/{slug}")).cloned();
-        let compare_to = if pr.is_some() {
-            Some(format!("origin/post/{slug}"))
-        } else if on_main.contains_key(slug) {
-            Some(s.base())
-        } else {
+        let status = repo.as_ref().map(|repo| ctx(repo, &s).status(slug, &dir, &prs)).transpose().unwrap_or_else(|e| {
+            warnings.push(format!("{slug}: {e}"));
             None
-        };
-        let dirty = match (&repo, &compare_to) {
-            (Some(repo), Some(rev)) => differs_from(repo, rev, &s.posts_dir, slug, &dir).unwrap_or(true),
-            _ => true,
-        };
-        let status = match (&pr, on_main.contains_key(slug)) {
-            (Some(_), _) => "review",
-            (None, true) if dirty => "changed",
-            (None, true) => "published",
-            (None, false) => "draft",
-        };
-        posts.push(PostSummary { slug: slug.clone(), status, pr, local: true, dirty, content });
+        });
+        posts.push(PostSummary {
+            slug: slug.clone(),
+            local: true,
+            content: fs::read_to_string(dir.join("index.md")).unwrap_or_default(),
+            sync: status,
+            pr: open_pr(slug),
+            on_main: on_main.contains_key(slug),
+            conflict: conflict_dir(app, slug)?.join("state.json").exists(),
+        });
     }
     if let Some(repo) = &repo {
-        let mut remote: Vec<(&String, &String)> =
-            on_main.iter().filter(|(id, _)| !local_set.contains(id)).collect();
+        let mut remote: Vec<(&String, &String)> = on_main.iter().filter(|(id, _)| !local_set.contains(id)).collect();
         remote.sort();
         for (id, path) in remote {
-            let content = git(repo, &["show", &format!("{}:{path}", s.base())]).unwrap_or_default();
             posts.push(PostSummary {
                 slug: id.clone(),
-                status: "published",
-                pr: prs.get(&format!("post/{id}")).cloned(),
                 local: false,
-                dirty: false,
-                content,
+                content: git(repo, &["show", &format!("{}:{path}", s.base())]).unwrap_or_default(),
+                sync: None,
+                pr: open_pr(id),
+                on_main: true,
+                conflict: false,
             });
         }
     }
-    Ok(PostList { posts, warnings })
+    Ok(PostList { posts, warnings, synced_at })
 }
+
 
 #[tauri::command]
 fn create_draft(app: AppHandle, state: State<AppState>, slug: String, content: String) -> Result<(), String> {
@@ -450,7 +395,8 @@ fn create_draft(app: AppHandle, state: State<AppState>, slug: String, content: S
         }
     }
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    write_atomic(&dir.join("index.md"), &content)?;
+    write_atomic(&dir.join("index.md"), content.as_bytes())?;
+    sync::init_new(&dir)?;
     backup_draft(&app, &slug);
     Ok(())
 }
@@ -466,7 +412,7 @@ fn save_draft(app: AppHandle, slug: String, content: String) -> Result<(), Strin
     if !path.exists() {
         return Err(format!("No draft named {slug}"));
     }
-    write_atomic(&path, &content)?;
+    write_atomic(&path, content.as_bytes())?;
     backup_draft(&app, &slug);
     Ok(())
 }
@@ -513,140 +459,174 @@ fn add_image(app: AppHandle, slug: String, source: String) -> Result<String, Str
     Ok(name)
 }
 
+/// Fetches, then brings remote changes into the draft. A conflict leaves the draft untouched.
 #[tauri::command]
-async fn publish(app: AppHandle, slug: String, title: String, body: String) -> Result<PublishResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut step = "sync";
-        let result = publish_blocking(&app, &slug, &title, &body, &mut step);
-        if let Err(e) = &result {
-            let _ = app.emit("publish-progress", Progress { step, state: "error", detail: e.clone() });
-        }
-        result
+async fn pull_post(app: AppHandle, slug: String) -> Result<sync::PullOutcome, String> {
+    with_repo(app, move |app, repo, s| {
+        sync_remote(app, repo, s)?;
+        let out = ctx(repo, s).pull(&slug, &draft_path(app, &slug)?, &prs(app), &conflict_dir(app, &slug)?, &undo_dir(app, &slug)?)?;
+        backup_draft(app, &slug);
+        Ok(out)
     })
     .await
-    .map_err(|e| e.to_string())?
 }
 
-fn publish_blocking(
-    app: &AppHandle,
-    slug: &str,
-    title: &str,
-    body: &str,
-    step: &mut &'static str,
-) -> Result<PublishResult, String> {
-    let draft = draft_path(app, slug)?;
-    if !draft.join("index.md").is_file() {
-        return Err(format!("No draft named {slug}"));
-    }
-    let state: State<AppState> = app.state();
-    let _guard = state.repo_lock.lock().unwrap();
-    let emit = |step: &'static str, state: &'static str, detail: String| {
-        let _ = app.emit("publish-progress", Progress { step, state, detail });
-    };
-    let s = load_settings(app)?;
-    let branch = format!("post/{slug}");
-    let dest = format!("{}/{slug}", s.posts_dir);
-
-    *step = "sync";
-    emit("sync", "active", "Fetching origin".into());
-    let repo = ensure_repo(app, &s)?;
-    git(&repo, &["fetch", "--quiet", "--prune", "origin"])?;
-    refresh_prs(&state, &repo, &s)?;
-    let existing = state.prs.lock().unwrap().get(&branch).cloned();
-    if existing.is_none() && base_posts(&repo, &s)?.get(slug).is_some_and(|p| !p.ends_with("/index.md")) {
-        return Err(format!(
-            "{slug} is a single-file post on {}; mdwriter only publishes folder posts",
-            s.branch
-        ));
-    }
-    emit("sync", "done", String::new());
-
-    *step = "branch";
-    let base = match &existing {
-        Some(_) => format!("origin/{branch}"),
-        None => s.base(),
-    };
-    emit("branch", "active", String::new());
-    git(&repo, &["checkout", "--quiet", "--force", "--no-track", "-B", &branch, &base])?;
-    git(&repo, &["clean", "-fdq"])?;
-    let dest_path = repo.join(&dest);
-    if dest_path.exists() {
-        fs::remove_dir_all(&dest_path).map_err(|e| e.to_string())?;
-    }
-    copy_dir(&draft, &dest_path)?;
-    emit("branch", "done", String::new());
-
-    *step = "commit";
-    emit("commit", "active", String::new());
-    git(&repo, &["add", "--all", "--", &dest])?;
-    let staged = command("git", &repo)
-        .args(["diff", "--cached", "--quiet"])
-        .status()
-        .map_err(|e| e.to_string())?;
-    let has_changes = !staged.success();
-    if has_changes {
-        git(&repo, &["commit", "--quiet", "-m", &format!("post: {slug}")])?;
-        emit("commit", "done", String::new());
-    } else if existing.is_some() {
-        emit("commit", "done", "No changes since the last push".into());
-    } else {
-        return Err(format!("This post is identical to what is on {}; nothing to publish", s.branch));
-    }
-
-    *step = "push";
-    if has_changes {
-        emit("push", "active", String::new());
-        if existing.is_some() {
-            git(&repo, &["push", "--quiet", "origin", &format!("HEAD:refs/heads/{branch}")])?;
-        } else {
-            // A leftover branch from a closed PR is replaced; the lease refuses if it moved since the fetch.
-            git(&repo, &["push", "--quiet", "--force-with-lease", "origin", &format!("HEAD:refs/heads/{branch}")])?;
+/// Fetches, then commits the draft to `post/<slug>` and pushes it. Refused while the remote has changes.
+#[tauri::command]
+async fn push_post(app: AppHandle, slug: String) -> Result<String, String> {
+    with_repo(app, move |app, repo, s| {
+        if conflict_dir(app, &slug)?.join("state.json").exists() {
+            return Err("Resolve the conflict first".into());
         }
-        emit("push", "done", String::new());
-    } else {
-        emit("push", "done", "Nothing to push".into());
-    }
-
-    *step = "pr";
-    let result = match existing {
-        Some(pr) => {
-            emit("pr", "done", format!("Updated PR #{}", pr.number));
-            PublishResult { number: pr.number, url: pr.url, created: false, pushed: has_changes }
-        }
-        None => {
-            emit("pr", "active", String::new());
-            let url = gh_pr_create(&repo, &s, &branch, title, body)?;
-            let number = url
-                .rsplit('/')
-                .next()
-                .and_then(|n| n.parse().ok())
-                .ok_or_else(|| format!("Unexpected gh output: {url}"))?;
-            state
-                .prs
-                .lock()
-                .unwrap()
-                .insert(branch.clone(), Pr { number, url: url.clone() });
-            emit("pr", "done", format!("Opened PR #{number}"));
-            PublishResult { number, url, created: true, pushed: true }
-        }
-    };
-    Ok(result)
+        sync_remote(app, repo, s)?;
+        let sha = ctx(repo, s).push(&slug, &draft_path(app, &slug)?, &prs(app))?;
+        backup_draft(app, &slug);
+        Ok(sha)
+    })
+    .await
 }
 
-fn gh_pr_create(repo: &Path, s: &Settings, branch: &str, title: &str, body: &str) -> Result<String, String> {
-    let out = exec(
-        repo,
-        "gh",
-        &[
-            "pr", "create", "--repo", &s.repo, "--base", &s.branch, "--head", branch, "--title", title, "--body", body,
-        ],
-    )?;
-    out.lines()
-        .rev()
-        .find(|l| l.starts_with("https://"))
-        .map(str::to_string)
-        .ok_or_else(|| format!("Unexpected gh output: {out}"))
+/// Opens a PR from the pushed `post/<slug>` branch into the main branch.
+#[tauri::command]
+async fn open_pr(app: AppHandle, slug: String, title: String, body: String) -> Result<PrInfo, String> {
+    with_repo(app, move |app, repo, s| {
+        let branch = format!("post/{slug}");
+        if sync::read_meta(&draft_path(app, &slug)?).branch.as_deref() != Some(branch.as_str())
+            || sync::rev_sha(repo, &format!("origin/{branch}")).is_none()
+        {
+            return Err("Push the post first".into());
+        }
+        let out = exec(
+            repo,
+            "gh",
+            &["pr", "create", "--repo", &s.repo, "--base", &s.branch, "--head", &branch, "--title", &title, "--body", &body],
+        )?;
+        let url = out.lines().rev().find(|l| l.starts_with("https://")).ok_or_else(|| format!("Unexpected gh output: {out}"))?;
+        let number = url.rsplit('/').next().and_then(|n| n.parse().ok()).ok_or_else(|| format!("Unexpected gh output: {url}"))?;
+        let pr = PrInfo {
+            number,
+            url: url.to_string(),
+            state: "OPEN".into(),
+            head_oid: sync::rev_sha(repo, &format!("origin/{branch}")).unwrap_or_default(),
+        };
+        app.state::<AppState>().cache.lock().unwrap().prs.insert(branch, pr.clone());
+        Ok(pr)
+    })
+    .await
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConflictView {
+    #[serde(flatten)]
+    conflict: sync::Conflict,
+    /// Folder with the remote side's files, for image thumbnails.
+    remote_dir: String,
+}
+
+#[tauri::command]
+fn conflict_state(app: AppHandle, slug: String) -> Result<Option<ConflictView>, String> {
+    let dir = conflict_dir(&app, &slug)?;
+    Ok(sync::read_conflict(&dir)
+        .map(|conflict| ConflictView { conflict, remote_dir: dir.join("remote").to_string_lossy().to_string() }))
+}
+
+/// Writes the resolved text and image choices into the draft; the remote becomes its new base.
+#[tauri::command]
+fn resolve_conflict(app: AppHandle, slug: String, text: Option<String>, remote_images: Vec<String>) -> Result<(), String> {
+    let draft = draft_path(&app, &slug)?;
+    sync::resolve(&draft, &conflict_dir(&app, &slug)?, &undo_dir(&app, &slug)?, text.as_deref(), &remote_images)?;
+    backup_draft(&app, &slug);
+    Ok(())
+}
+
+/// Drops a conflicted pull. The draft was never changed, so nothing else happens.
+#[tauri::command]
+fn abort_conflict(app: AppHandle, slug: String) -> Result<(), String> {
+    let dir = conflict_dir(&app, &slug)?;
+    if dir.exists() {
+        fs::remove_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Puts the draft back exactly as it was before the last pull or resolve.
+#[tauri::command]
+fn undo_pull(app: AppHandle, slug: String) -> Result<(), String> {
+    sync::undo_pull(&draft_path(&app, &slug)?, &undo_dir(&app, &slug)?)?;
+    backup_draft(&app, &slug);
+    Ok(())
+}
+
+/// Starts a local draft from a post on the main branch.
+#[tauri::command]
+async fn edit_post(app: AppHandle, slug: String) -> Result<(), String> {
+    with_repo(app, move |app, repo, s| {
+        let draft = draft_path(app, &slug)?;
+        if draft.exists() {
+            return Err(format!("A draft named {slug} already exists"));
+        }
+        let result = ctx(repo, s).start_from_main(&slug, &draft);
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&draft);
+        }
+        result?;
+        backup_draft(app, &slug);
+        Ok(())
+    })
+    .await
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Commit {
+    sha: String,
+    /// Unix time in seconds.
+    date: u64,
+    subject: String,
+}
+
+/// Recent commits that changed the post, on the main branch and on `post/<slug>`.
+#[tauri::command]
+async fn post_history(app: AppHandle, slug: String) -> Result<Vec<Commit>, String> {
+    check_slug(&slug)?;
+    with_repo(app, move |_, repo, s| {
+        let mut args = vec!["log".to_string(), "-n".into(), "30".into(), "--format=%H%x1f%ct%x1f%s".into(), s.base()];
+        let branch = format!("origin/post/{slug}");
+        if sync::rev_sha(repo, &branch).is_some() {
+            args.push(branch);
+        }
+        args.extend(["--".into(), format!("{}/{slug}", s.posts_dir), format!("{}/{slug}.md", s.posts_dir)]);
+        let out = git(repo, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
+        Ok(out
+            .lines()
+            .filter_map(|l| {
+                let mut p = l.split('\x1f');
+                Some(Commit { sha: p.next()?.into(), date: p.next()?.parse().ok()?, subject: p.next()?.into() })
+            })
+            .collect())
+    })
+    .await
+}
+
+/// The post's index.md as of `rev`: "base" (last synced), "main", or a commit hash. None when the post
+/// didn't exist there.
+#[tauri::command]
+async fn text_at(app: AppHandle, slug: String, rev: String) -> Result<Option<String>, String> {
+    let draft = draft_path(&app, &slug)?;
+    if rev == "base" {
+        return Ok(sync::base_known(&draft).then(|| fs::read_to_string(draft.join(sync::BASE).join("index.md")).unwrap_or_default()));
+    }
+    if rev != "main" && !(rev.len() >= 7 && rev.len() <= 40 && rev.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err(format!("Not a commit: {rev}"));
+    }
+    with_repo(app, move |_, repo, s| {
+        let rev = if rev == "main" { s.base() } else { rev };
+        ctx(repo, s).text_at(&rev, &slug)
+    })
+    .await
+}
+
 
 #[tauri::command]
 fn get_settings(app: AppHandle) -> Result<Settings, String> {
@@ -674,10 +654,11 @@ fn store_settings(app: &AppHandle, next: &Settings) -> Result<(), String> {
         let repo = repo_dir(app)?;
         if prev.repo != next.repo && repo.exists() {
             fs::remove_dir_all(&repo).map_err(|e| e.to_string())?;
-            state.prs.lock().unwrap().clear();
+            *state.cache.lock().unwrap() = SyncCache::default();
+            let _ = fs::remove_file(data_dir(app)?.join("sync.json"));
         }
         let json = serde_json::to_string_pretty(next).map_err(|e| e.to_string())?;
-        write_atomic(&settings_path(app)?, &json)?;
+        write_atomic(&settings_path(app)?, json.as_bytes())?;
         prev
     };
     if next.backup {
@@ -721,8 +702,16 @@ fn local_drafts(drafts: &Path) -> Result<Vec<String>, String> {
     Ok(slugs)
 }
 
-/// Copies the files of a draft folder that are missing or older in `to`. Never deletes.
+/// Copies the files of a draft folder that are missing or older in `to`, never deleting any, and makes the
+/// sync state (`.base/` and `.mdwriter.json`) in `to` match `from` exactly, so a restored draft keeps its base.
 fn mirror(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(|e| e.to_string())?;
+    if from.join(sync::BASE).is_dir() {
+        sync::replace_files(&from.join(sync::BASE), &to.join(sync::BASE))?;
+    }
+    if from.join(sync::META).is_file() {
+        fs::copy(from.join(sync::META), to.join(sync::META)).map_err(|e| e.to_string())?;
+    }
     fs::create_dir_all(to).map_err(|e| e.to_string())?;
     for name in draft_files(from)? {
         let (src, dst) = (from.join(&name), to.join(&name));
@@ -992,6 +981,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::default())
         .setup(|app| {
+            let cache = data_dir(app.handle())
+                .ok()
+                .and_then(|d| fs::read_to_string(d.join("sync.json")).ok())
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            *app.state::<AppState>().cache.lock().unwrap() = cache;
             // The default Quit item terminates the app with no chance to save, so swap it for one that asks first.
             #[cfg(target_os = "macos")]
             {
@@ -1024,7 +1019,16 @@ pub fn run() {
             save_draft,
             post_files,
             add_image,
-            publish,
+            pull_post,
+            push_post,
+            open_pr,
+            conflict_state,
+            resolve_conflict,
+            abort_conflict,
+            undo_pull,
+            edit_post,
+            post_history,
+            text_at,
             get_settings,
             save_settings,
             backup_status,

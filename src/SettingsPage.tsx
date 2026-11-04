@@ -156,6 +156,13 @@ export function SettingsPage({
         onChange={(livePreview) => set({ livePreview })}
       />
 
+      <Toggle
+        label="Line numbers"
+        hint="Number the lines of the post body, in the editor and in diffs."
+        checked={form.lineNumbers}
+        onChange={(lineNumbers) => set({ lineNumbers })}
+      />
+
       <h2>Backup</h2>
       <Toggle
         label="Back up to iCloud Drive"

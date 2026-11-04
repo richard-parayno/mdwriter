@@ -1,20 +1,33 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type Status = "draft" | "review" | "published" | "changed";
-export type Pr = { number: number; url: string };
+export type PrInfo = { number: number; url: string; state: "OPEN" | "MERGED" | "CLOSED"; headOid: string };
+/** Sync state of a local draft against the branch it tracks. */
+export type SyncStatus = {
+  /** The main branch or `post/<slug>`. */
+  upstream: string;
+  baseKnown: boolean;
+  /** Lines changed in index.md plus other files changed since the last sync. */
+  changes: number;
+  /** Commits on the upstream that changed the post since the last sync. */
+  behind: number;
+  onRemote: boolean;
+  inSync: boolean;
+};
 export type PostSummary = {
   slug: string;
-  status: Status;
-  pr: Pr | null;
   local: boolean;
-  dirty: boolean;
   content: string;
+  sync: SyncStatus | null;
+  pr: PrInfo | null;
+  onMain: boolean;
+  conflict: boolean;
 };
-export type PostList = { posts: PostSummary[]; warnings: string[] };
+export type PostList = { posts: PostSummary[]; warnings: string[]; syncedAt: number | null };
 export type PostFiles = { dir: string; images: string[] };
-export type PublishResult = { number: number; url: string; created: boolean; pushed: boolean };
-export type StepId = "sync" | "branch" | "commit" | "push" | "pr";
-export type Progress = { step: StepId; state: "active" | "done" | "error"; detail: string };
+export type TextConflict = { name: string; ours: string; theirs: string };
+export type Conflict = { upstream: string; text: TextConflict | null; binary: string[]; remoteDir: string };
+export type PullOutcome = { kind: "upToDate" } | { kind: "updated"; files: string[] } | ({ kind: "conflict" } & Omit<Conflict, "remoteDir">);
+export type Commit = { sha: string; date: number; subject: string };
 export type Settings = {
   repo: string;
   branch: string;
@@ -23,6 +36,7 @@ export type Settings = {
   postUrl: string;
   editorFontSize: number;
   livePreview: boolean;
+  lineNumbers: boolean;
   backup: boolean;
 };
 export type BackupStatus = {
@@ -41,8 +55,18 @@ export const api = {
   saveDraft: (slug: string, content: string) => invoke<void>("save_draft", { slug, content }),
   postFiles: (slug: string) => invoke<PostFiles>("post_files", { slug }),
   addImage: (slug: string, source: string) => invoke<string>("add_image", { slug, source }),
-  publish: (slug: string, title: string, body: string) =>
-    invoke<PublishResult>("publish", { slug, title, body }),
+  pull: (slug: string) => invoke<PullOutcome>("pull_post", { slug }),
+  push: (slug: string) => invoke<string>("push_post", { slug }),
+  openPr: (slug: string, title: string, body: string) => invoke<PrInfo>("open_pr", { slug, title, body }),
+  conflict: (slug: string) => invoke<Conflict | null>("conflict_state", { slug }),
+  resolve: (slug: string, text: string | null, remoteImages: string[]) =>
+    invoke<void>("resolve_conflict", { slug, text, remoteImages }),
+  abortConflict: (slug: string) => invoke<void>("abort_conflict", { slug }),
+  undoPull: (slug: string) => invoke<void>("undo_pull", { slug }),
+  edit: (slug: string) => invoke<void>("edit_post", { slug }),
+  history: (slug: string) => invoke<Commit[]>("post_history", { slug }),
+  /** index.md at "base" (last synced), "main", or a commit hash. */
+  textAt: (slug: string, rev: string) => invoke<string | null>("text_at", { slug, rev }),
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
   backupStatus: () => invoke<BackupStatus>("backup_status"),

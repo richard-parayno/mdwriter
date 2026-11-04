@@ -19,11 +19,11 @@ cargo tauri build    # builds src-tauri/target/release/bundle/macos/mdwriter.app
 - **Drafts** live in `~/Library/Application Support/com.richardparayno.mdwriter/drafts/<slug>/index.md`, with dropped images copied beside them and referenced as `./name.png`. They save automatically as you type.
 - **Backup**, when on, copies each draft and `settings.json` to `iCloud Drive/mdwriter` as they save. It never deletes anything there. On another Mac, Settings offers to restore drafts that aren't on that Mac and the backed-up settings.
 - **Git work** happens in the app's own clone at `.../com.richardparayno.mdwriter/repo`, never in your own checkout of the blog.
-- **Publish as PR** fetches `origin`, creates `post/<slug>` from `origin/main`, copies the draft folder to `src/content/posts/<slug>/`, commits only that folder (`post: <slug>`), pushes, and runs `gh pr create`. If `post/<slug>` already has an open PR, the app pushes a new commit to that branch instead.
-- **Status** comes from `gh pr list` (open PRs by head branch) and `origin/main`:
-  - Local draft: not on main and has no PR.
-  - In review: has an open PR.
-  - Published: on main and identical to the draft.
-  - Merged · draft: on main with `draft: true`.
-  - Unpublished changes: on main, and the local draft differs.
-- Posts that exist only on `main` (including the older single-file posts) are shown read-only.
+- **Each post is a branch, `post/<slug>`.** Upstream is the source of truth. Each draft keeps a hidden `.base/` copy of the files as they were the last time it matched the remote, plus `.mdwriter.json` with the commit. The git logic is in `src-tauri/src/sync.rs`.
+- **Opening the app only reads.** Posts list straight away from local state, and a background fetch plus `gh pr list` updates the counts. Nothing changes a draft or GitHub until you pick an action.
+- **Pull** (⌘⇧L) fetches, then merges remote changes into the draft. With no clashes, they merge in and **Undo** restores the exact draft. With clashes, the draft stays untouched and a side-by-side view opens: the left side (yours, with the clean remote changes already merged in) becomes the draft on **Resolve**. **Abort** drops the pull.
+- **Push** (⌘⇧P) commits the draft to `post/<slug>` and pushes. It refuses while the remote has changes you haven't pulled, and the push carries `--force-with-lease`, so GitHub also refuses it if the branch moved since the last fetch. Single-file posts stay single files until they get images.
+- **Open PR** opens a PR from `post/<slug>` into the main branch, as its own step. Once the PR is merged, the draft tracks the main branch again.
+- **Edit** starts a draft from a post that is only on the main branch.
+- **Review changes** shows the remote against your draft: what Push would send. **Change markers** (⌘⇧D, or the picker in the footer) mark lines added, changed or removed since the last sync, the main branch, or any commit of the post. Click a marker to see the old text and revert it.
+- **⌘K** lists every action and post.
