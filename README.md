@@ -2,7 +2,7 @@
 
 A personal macOS app (Tauri v2 + React) for writing posts for my Astro blog ([richard-parayno/blog](https://github.com/richard-parayno/blog)) and publishing each post as its own GitHub PR.
 
-The blog repo is set in `src-tauri/src/lib.rs` (`REMOTE`, `GH_REPO`, `POSTS_DIR`). The frontmatter editor follows the blog's `posts` schema in `src/content.config.ts`.
+The repository, branch (`main` by default), posts folder, live post URL (Detect site reads it from the Astro project and checks it on the live site), editor font size, live preview, and iCloud backup are set on the Settings page (gear icon) and saved to `.../com.richardparayno.mdwriter/settings.json`. Below, `main` means the configured branch. The frontmatter editor follows the blog's `posts` schema in `src/content.config.ts`.
 
 ## Run
 
@@ -17,6 +17,7 @@ cargo tauri build    # builds src-tauri/target/release/bundle/macos/mdwriter.app
 ## How it works
 
 - **Drafts** live in `~/Library/Application Support/com.richardparayno.mdwriter/drafts/<slug>/index.md`, with dropped images copied beside them and referenced as `./name.png`. They save automatically as you type.
+- **Backup**, when on, copies each draft and `settings.json` to `iCloud Drive/mdwriter` as they save. It never deletes anything there. On another Mac, Settings offers to restore drafts that aren't on that Mac and the backed-up settings.
 - **Git work** happens in the app's own clone at `.../com.richardparayno.mdwriter/repo`, never in your own checkout of the blog.
 - **Publish as PR** fetches `origin`, creates `post/<slug>` from `origin/main`, copies the draft folder to `src/content/posts/<slug>/`, commits only that folder (`post: <slug>`), pushes, and runs `gh pr create`. If `post/<slug>` already has an open PR, the app pushes a new commit to that branch instead.
 - **Status** comes from `gh pr list` (open PRs by head branch) and `origin/main`:

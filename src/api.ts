@@ -15,6 +15,24 @@ export type PostFiles = { dir: string; images: string[] };
 export type PublishResult = { number: number; url: string; created: boolean; pushed: boolean };
 export type StepId = "sync" | "branch" | "commit" | "push" | "pr";
 export type Progress = { step: StepId; state: "active" | "done" | "error"; detail: string };
+export type Settings = {
+  repo: string;
+  branch: string;
+  postsDir: string;
+  /** Live URL of a post with `{slug}` in place of the slug; empty hides the Site button. */
+  postUrl: string;
+  editorFontSize: number;
+  livePreview: boolean;
+  backup: boolean;
+};
+export type BackupStatus = {
+  dir: string | null;
+  lastBackup: number | null;
+  error: string | null;
+  restorableDrafts: string[];
+  restorableSettings: boolean;
+};
+export type SiteDetection = { url: string; foundIn: string[]; check: string; verified: boolean };
 
 export const api = {
   listPosts: (fetch: boolean) => invoke<PostList>("list_posts", { fetch }),
@@ -25,4 +43,9 @@ export const api = {
   addImage: (slug: string, source: string) => invoke<string>("add_image", { slug, source }),
   publish: (slug: string, title: string, body: string) =>
     invoke<PublishResult>("publish", { slug, title, body }),
+  getSettings: () => invoke<Settings>("get_settings"),
+  saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
+  backupStatus: () => invoke<BackupStatus>("backup_status"),
+  restoreBackup: () => invoke<Settings>("restore_backup"),
+  detectSite: (branch: string, postsDir: string) => invoke<SiteDetection>("detect_site", { branch, postsDir }),
 };

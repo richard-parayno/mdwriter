@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CodeMirror from "@uiw/react-codemirror";
-import { markdown } from "@codemirror/lang-markdown";
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorView } from "@codemirror/view";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -21,18 +21,21 @@ import {
   LoaderCircle,
   Plus,
   RefreshCw,
+  Settings as SettingsIcon,
   Upload,
   X,
 } from "lucide-react";
-import { api, type PostFiles, type PostSummary, type Progress, type StepId } from "./api";
+import { api, type PostFiles, type PostSummary, type Progress, type Settings, type StepId } from "./api";
 import { parsePost, serializePost, slugify, today, type Post } from "./frontmatter";
+import { postUrl, SettingsPage } from "./SettingsPage";
+import { livePreview } from "./livePreview";
 
-const SITE = "https://richardparayno.com";
 const highlight = syntaxHighlighting(
   HighlightStyle.define([
     { tag: t.heading, fontWeight: "700", color: "var(--fg)" },
     { tag: t.strong, fontWeight: "700" },
     { tag: t.emphasis, fontStyle: "italic" },
+    { tag: t.strikethrough, textDecoration: "line-through" },
     { tag: [t.link, t.url], color: "var(--info)" },
     { tag: [t.processingInstruction, t.meta, t.contentSeparator], color: "var(--muted)" },
     { tag: t.monospace, color: "var(--warning)" },
@@ -73,6 +76,8 @@ export default function App() {
   const [creating, setCreating] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [newError, setNewError] = useState("");
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [showSettings, setShowSettings] = useState(false);
 
   const view = useRef<EditorView | null>(null);
   const docRef = useRef<Post | null>(null);
@@ -146,13 +151,24 @@ export default function App() {
     [posts, flushSave],
   );
 
+  const open = useCallback((url: string) => {
+    openUrl(url).catch((e) => setWarnings([`Could not open ${url}: ${e}`]));
+  }, []);
+
   useEffect(() => {
+    api.getSettings().then(setSettings, (e) => setWarnings([String(e)]));
     refresh(true).then((list) => {
       const first = [...list].sort(byStatus)[0];
       if (first) select(first.slug, list);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // The backend asks for this on Cmd+Q and window close, so an edit still in its 500 ms wait isn't lost.
+  useEffect(() => {
+    const un = listen("flush-before-quit", () => void flushSave().finally(() => invoke("quit")));
+    return () => void un.then((f) => f());
+  }, [flushSave]);
 
   useEffect(() => {
     const un = listen<Progress>("publish-progress", ({ payload }) => {
@@ -235,7 +251,7 @@ export default function App() {
     const body = [
       doc.fm.description,
       "",
-      `Published from mdwriter. Only \`src/content/posts/${slug}/\` changes in this PR.`,
+      `Published from mdwriter. Only \`${postsDir}/${slug}/\` changes in this PR.`,
     ].join("\n");
     try {
       await api.publish(slug, doc.fm.title || slug, body.trim());
@@ -246,7 +262,31 @@ export default function App() {
     await refresh(true);
   }
 
+  async function settingsSaved(next: Settings) {
+    setSettings(next);
+    setShowSettings(false);
+    const list = await refresh(true);
+    const keep = list.find((p) => p.slug === selectedRef.current) ?? [...list].sort(byStatus)[0];
+    if (keep) await select(keep.slug, list);
+    else {
+      setSelected(null);
+      setDoc(null);
+    }
+  }
+
+  const branch = settings?.branch ?? "main";
+  const postsDir = settings?.postsDir ?? "src/content/posts";
   const sorted = useMemo(() => [...posts].sort(byStatus), [posts]);
+  const filesDir = files?.dir;
+  const extensions = useMemo(() => {
+    // GitHub-flavored, like Astro: strikethrough, tables, task lists.
+    const base = [markdown({ base: markdownLanguage }), highlight, EditorView.lineWrapping];
+    if (!settings?.livePreview) return base;
+    // Remote images load directly; ./name images load from the draft folder (not for read-only posts).
+    const resolve = (url: string) =>
+      /^https?:\/\//.test(url) ? url : filesDir && !url.includes("..") ? convertFileSrc(`${filesDir}/${url.replace(/^\.\//, "")}`) : null;
+    return [...base, livePreview(resolve)];
+  }, [settings?.livePreview, filesDir]);
   const fm = doc?.fm;
   const setFm = (patch: Partial<Post["fm"]>) => doc && update({ ...doc, fm: { ...doc.fm, ...patch } });
   const [statusTone, label] = summary ? tone(summary, !!fm?.draft) : ["", ""];
@@ -265,6 +305,15 @@ export default function App() {
             </button>
             <button className="icon-btn" title="New post" onClick={() => setCreating((c) => !c)}>
               <Plus size={14} />
+            </button>
+            <button
+              className="icon-btn"
+              title="Settings"
+              aria-pressed={showSettings}
+              onClick={() => setShowSettings((s) => !s)}
+              disabled={!settings}
+            >
+              <SettingsIcon size={13} />
             </button>
           </div>
         </div>
@@ -301,8 +350,11 @@ export default function App() {
               <button
                 key={p.slug}
                 className="post"
-                aria-current={p.slug === selected}
-                onClick={() => select(p.slug)}
+                aria-current={p.slug === selected && !showSettings}
+                onClick={() => {
+                  setShowSettings(false);
+                  select(p.slug);
+                }}
               >
                 <span className="pt">{liveTitle(p)}</span>
                 <span className="status" data-tone={t}>
@@ -324,23 +376,28 @@ export default function App() {
       <main className="main">
         <header className="bar" data-tauri-drag-region>
           <span className="bar-title" data-tauri-drag-region>
-            {fm?.title || (summary ? "Untitled" : "mdwriter")}
+            {showSettings ? "Settings" : fm?.title || (summary ? "Untitled" : "mdwriter")}
           </span>
-          <div className="bar-actions">
-            {summary?.pr && (
-              <button className="ghost-btn" onClick={() => openUrl(summary.pr!.url)}>
-                <GitPullRequest size={13} /> PR #{summary.pr.number}
-              </button>
-            )}
-            {summary && (summary.status === "published" || summary.status === "changed") && (
-              <button className="ghost-btn" onClick={() => openUrl(`${SITE}/blog/${summary.slug}/`)}>
-                <ExternalLink size={13} /> Site
-              </button>
-            )}
-          </div>
+          {!showSettings && (
+            <div className="bar-actions">
+              {summary?.pr && (
+                <button className="ghost-btn" onClick={() => open(summary.pr!.url)}>
+                  <GitPullRequest size={13} /> PR #{summary.pr.number}
+                </button>
+              )}
+              {/* Posts with draft: true are built out of the live site, so their URL 404s. */}
+              {summary && (summary.status === "published" || summary.status === "changed") && !fm?.draft && postUrl(settings, summary.slug) && (
+                <button className="ghost-btn" title={postUrl(settings, summary.slug)!} onClick={() => open(postUrl(settings, summary.slug)!)}>
+                  <ExternalLink size={13} /> Site
+                </button>
+              )}
+            </div>
+          )}
         </header>
 
-        {doc && fm && summary ? (
+        {showSettings && settings ? (
+          <SettingsPage key={JSON.stringify(settings)} settings={settings} onSaved={settingsSaved} onClose={() => setShowSettings(false)} />
+        ) : doc && fm && summary ? (
           <>
             <section className="fm">
               <label>title</label>
@@ -394,13 +451,16 @@ export default function App() {
               </section>
             )}
 
-            <section className={`editor ${dragging ? "dragging" : ""}`}>
+            <section
+              className={`editor ${dragging ? "dragging" : ""}`}
+              style={settings ? ({ "--editor-font-size": `${settings.editorFontSize}px` } as React.CSSProperties) : undefined}
+            >
               <CodeMirror
                 key={selected}
                 value={doc.body}
                 editable={editable}
                 basicSetup={{ lineNumbers: false, foldGutter: false, highlightActiveLine: false, syntaxHighlighting: false }}
-                extensions={[markdown(), highlight, EditorView.lineWrapping]}
+                extensions={extensions}
                 onCreateEditor={(v) => (view.current = v)}
                 onChange={(body) => docRef.current && update({ ...docRef.current, body })}
                 placeholder="Start writing…"
@@ -409,7 +469,9 @@ export default function App() {
               {dragging && <div className="drop">Drop to add images to this post</div>}
             </section>
 
-            {run?.slug === summary.slug && <Steps run={run} slug={summary.slug} onClose={() => setRun(null)} />}
+            {run?.slug === summary.slug && (
+              <Steps run={run} slug={summary.slug} branch={branch} postsDir={postsDir} onClose={() => setRun(null)} />
+            )}
 
             <footer className="foot">
               <span className="status" data-tone={statusTone}>
@@ -418,7 +480,7 @@ export default function App() {
               </span>
               <span className="muted path">
                 <Folder size={12} />
-                {summary.local ? `src/content/posts/${summary.slug}/index.md` : "On main · read only"}
+                {summary.local ? `${postsDir}/${summary.slug}/index.md` : `On ${branch} · read only`}
               </span>
               {editable && <span className="muted">{saveState === "saving" ? "Saving…" : saveState === "error" ? "Save failed" : "Saved"}</span>}
               <span className="spacer" />
@@ -459,12 +521,24 @@ function PublishButton({ summary, running, onClick }: { summary: PostSummary; ru
   );
 }
 
-function Steps({ run, slug, onClose }: { run: PublishRun; slug: string; onClose: () => void }) {
+function Steps({
+  run,
+  slug,
+  branch,
+  postsDir,
+  onClose,
+}: {
+  run: PublishRun;
+  slug: string;
+  branch: string;
+  postsDir: string;
+  onClose: () => void;
+}) {
   const { update } = run;
   const text: Record<StepId, React.ReactNode> = {
     sync: <>Fetch the latest <code>origin</code> into mdwriter's own clone</>,
-    branch: update ? <>Check out <code>post/{slug}</code> from its PR</> : <>Create <code>post/{slug}</code> from <code>origin/main</code></>,
-    commit: <>Commit only <code>src/content/posts/{slug}/</code>: <code>post: {slug}</code></>,
+    branch: update ? <>Check out <code>post/{slug}</code> from its PR</> : <>Create <code>post/{slug}</code> from <code>origin/{branch}</code></>,
+    commit: <>Commit only <code>{postsDir}/{slug}/</code>: <code>post: {slug}</code></>,
     push: <>Push <code>post/{slug}</code></>,
     pr: update ? <>Update the open PR</> : <>Open a PR with the description as its body</>,
   };
