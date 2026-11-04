@@ -12,6 +12,7 @@ Needs Rust, the Tauri CLI (`cargo install tauri-cli`), pnpm, `git` with SSH acce
 pnpm install
 cargo tauri dev      # development, with hot reload
 cargo tauri build    # builds src-tauri/target/release/bundle/macos/mdwriter.app
+pnpm release         # builds, installs to /Applications, and restarts mdwriter if it was open
 ```
 
 ## How it works

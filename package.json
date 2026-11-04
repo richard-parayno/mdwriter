@@ -8,7 +8,8 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc --noEmit",
-    "tauri": "cargo tauri"
+    "tauri": "cargo tauri",
+    "release": "sh scripts/release.sh"
   },
   "dependencies": {
     "@codemirror/lang-markdown": "^6.5.2",
