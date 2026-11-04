@@ -29,6 +29,7 @@ import { livePreview } from "./livePreview";
 import { changeMarkers } from "./changeMarkers";
 import { ConflictView, ReviewView } from "./DiffViews";
 import { Palette, type Cmd } from "./Palette";
+import { Setup } from "./Setup";
 
 const highlight = syntaxHighlighting(
   HighlightStyle.define([
@@ -599,6 +600,9 @@ export default function App() {
       </>
     );
   };
+
+  // First run: nothing works without a repository, so ask for one before showing the app.
+  if (settings && !settings.repo) return <Setup initial={settings} onDone={settingsSaved} />;
 
   return (
     <div className="app">

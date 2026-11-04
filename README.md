@@ -78,14 +78,14 @@ pnpm release         # builds, installs to /Applications, and restarts mdwriter 
 
 ## Setup
 
-Open Settings (⌘,) and set:
+On first launch, mdwriter asks for these in two steps. You can change them later in Settings (⌘,).
 
 - **GitHub repository**, as `owner/name`. mdwriter clones it into its own folder.
 - **Branch**: the branch posts are read from and pull requests target, usually `main`.
 - **Posts folder**: where posts live in the repository, such as `src/content/posts`.
 - **Post URL**: the live URL of a post, with `{slug}` in place of the slug. For an Astro project, **Detect site** works it out for you (see below).
 
-Settings are saved in `~/Library/Application Support/com.richardparayno.mdwriter/settings.json`.
+Continue checks that the repository and branch are reachable before saving. If you turned on iCloud backup on another Mac, the first screen offers to restore those settings instead. Settings are saved in `~/Library/Application Support/com.richardparayno.mdwriter/settings.json`.
 
 ## Astro support
 

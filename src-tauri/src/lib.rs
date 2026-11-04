@@ -39,10 +39,10 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            repo: "richard-parayno/blog".into(),
+            repo: String::new(),
             branch: "main".into(),
             posts_dir: "src/content/posts".into(),
-            post_url: "https://richardparayno.com/blog/{slug}/".into(),
+            post_url: String::new(),
             editor_font_size: 14,
             live_preview: true,
             line_numbers: true,
@@ -186,7 +186,7 @@ fn validate(app: &AppHandle, mut s: Settings) -> Result<Settings, String> {
         return Err("Editor font size must be between 10 and 24".into());
     }
     let heads = exec(&data_dir(app)?, "git", &["ls-remote", "--heads", &s.remote(), &s.branch])
-        .map_err(|e| format!("Could not reach {}: {e}", s.repo))?;
+        .map_err(|_| format!("Couldn't reach {}. Check the name, and that your SSH key can access it.", s.repo))?;
     if !heads.lines().any(|l| l.ends_with(&format!("refs/heads/{}", s.branch))) {
         return Err(format!("{} has no branch named {}", s.repo, s.branch));
     }
@@ -195,6 +195,9 @@ fn validate(app: &AppHandle, mut s: Settings) -> Result<Settings, String> {
 
 /// Clones the blog into the app data dir on first use.
 fn ensure_repo(app: &AppHandle, s: &Settings) -> Result<PathBuf, String> {
+    if s.repo.is_empty() {
+        return Err("Set up a repository first".into());
+    }
     let repo = repo_dir(app)?;
     if !repo.join(".git").exists() {
         exec(&data_dir(app)?, "git", &["clone", "--quiet", &s.remote(), "repo"])?;
@@ -316,8 +319,10 @@ fn list_posts_blocking(app: &AppHandle, fetch: bool) -> Result<PostList, String>
     let mut warnings = Vec::new();
     let s = load_settings(app)?;
 
+    // Before setup there is no repository: list local drafts only, without a warning.
     let repo = match ensure_repo(app, &s) {
         Ok(repo) => Some(repo),
+        Err(_) if s.repo.is_empty() => None,
         Err(e) => {
             warnings.push(e);
             None
@@ -652,7 +657,9 @@ fn store_settings(app: &AppHandle, next: &Settings) -> Result<(), String> {
         let _guard = state.repo_lock.lock().unwrap();
         let prev = load_settings(app).unwrap_or_default();
         let repo = repo_dir(app)?;
-        if prev.repo != next.repo && repo.exists() {
+        // Keep the clone when it already points at this repository, e.g. on first-run setup.
+        let origin = git(&repo, &["remote", "get-url", "origin"]).ok();
+        if repo.exists() && origin.as_deref() != Some(next.remote().as_str()) {
             fs::remove_dir_all(&repo).map_err(|e| e.to_string())?;
             *state.cache.lock().unwrap() = SyncCache::default();
             let _ = fs::remove_file(data_dir(app)?.join("sync.json"));
