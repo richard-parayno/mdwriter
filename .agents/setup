@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Prepares an Amp orb (Debian 12) to build and test mdwriter: Tauri's Linux libraries from apt, the
+# toolchain pinned in .tool-versions through mise, and the JavaScript dependencies.
+set -euo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+repo_root="$PWD"
+
+step() {
+  local label="$1"
+  shift
+  local start=$SECONDS
+  echo "==> $label"
+  "$@"
+  echo "<== $label ($((SECONDS - start))s)"
+}
+
+# Tauri's Linux build prerequisites: https://v2.tauri.app/start/prerequisites/#linux
+apt_packages=(
+  build-essential
+  curl
+  file
+  pkg-config
+  libssl-dev
+  libgtk-3-dev
+  libwebkit2gtk-4.1-dev
+  librsvg2-dev
+  libxdo-dev
+)
+
+install_apt_packages() {
+  local missing=()
+  local pkg
+  for pkg in "${apt_packages[@]}"; do
+    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" || missing+=("$pkg")
+  done
+  if ((${#missing[@]} == 0)); then
+    echo "all apt packages present"
+    return
+  fi
+  sudo apt-get update -qq
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing[@]}"
+}
+
+mise_bin="$HOME/.local/bin/mise"
+mise_shims="$HOME/.local/share/mise/shims"
+
+install_mise() {
+  if [[ -x "$mise_bin" ]]; then
+    "$mise_bin" --version
+    return
+  fi
+  curl -fsSL https://mise.run | MISE_QUIET=1 sh
+}
+
+install_toolchain() {
+  # cargo-binstall lets mise fetch a prebuilt tauri-cli instead of compiling it.
+  "$mise_bin" use --global --yes cargo-binstall
+  "$mise_bin" install --yes
+}
+
+persist_shell_environment() {
+  local marker="# mdwriter: mise toolchain from .tool-versions"
+  if grep -Fqx "$marker" "$HOME/.bash_profile" 2>/dev/null; then
+    echo "~/.bash_profile already configured"
+    return
+  fi
+  cat >>"$HOME/.bash_profile" <<EOF
+
+$marker
+case ":\$PATH:" in
+  *":$mise_shims:"*) ;;
+  *) export PATH="$HOME/.local/bin:$mise_shims:\$PATH" ;;
+esac
+EOF
+}
+
+export PATH="$HOME/.local/bin:$mise_shims:$PATH"
+
+step "apt packages" install_apt_packages
+step "mise" install_mise
+step "toolchain (.tool-versions)" install_toolchain
+step "shell environment" persist_shell_environment
+step "pnpm install" pnpm install --frozen-lockfile
+# Warm Cargo's registry and build cache so `cargo test --lib` and `cargo tauri dev` start quickly.
+step "cargo test build" cargo test --manifest-path "$repo_root/src-tauri/Cargo.toml" --lib --no-run
