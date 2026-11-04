@@ -60,7 +60,10 @@ code { font-family: var(--mono); font-size: 11.5px; }
 /* Sidebar */
 .side { background: var(--side); border-right: 1px solid var(--border); display: flex; flex-direction: column; min-width: 0; }
 .drag { height: 38px; flex: none; }
-.side-head { display: flex; justify-content: space-between; align-items: center; padding: 0 10px 6px 14px; }
+.side-head { display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 0 10px 6px 8px; }
+.project-btn { display: inline-flex; align-items: center; gap: 6px; min-width: 0; padding: 3px 6px; border: 0; border-radius: 6px; background: none; font-weight: 600; }
+.project-btn:hover { background: var(--hover); }
+.project-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .post-list { flex: 1; overflow: auto; padding: 0 8px 8px; display: grid; align-content: start; gap: 1px; }
 .post { display: grid; gap: 3px; text-align: left; padding: 7px 8px; border-radius: 7px; border: 0; background: none; cursor: default; min-width: 0; }
 .post:hover { background: var(--hover); }
@@ -165,6 +168,16 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .backup-status { margin-top: -6px; padding-left: 23px; }
 .link-btn { border: 0; background: none; padding: 0; color: var(--accent); font-size: 11px; cursor: pointer; }
 .link-btn:hover { text-decoration: underline; }
+.section-head { margin: 0 0 -4px; align-items: center; }
+.settings .section-head h2 { margin: 0; line-height: 1; }
+.keybinds { display: grid; gap: 2px; }
+.keybind { gap: 6px; min-height: 28px; }
+.kbd-btn { min-width: 96px; padding: 3px 8px; border: 1px solid transparent; border-radius: 6px; background: none; text-align: right; font-size: 11.5px; }
+.kbd-btn:hover { border-color: var(--border); }
+.kbd-btn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); text-align: center; }
+.keybinds .hint { margin-top: 4px; }
+.keybinds .warn-text { margin-top: 4px; }
+.archived { gap: 8px; font-size: 12.5px; }
 .restore { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 7px; background: var(--info-bg); color: var(--info); font-size: 12px; }
 
 /* Live preview */

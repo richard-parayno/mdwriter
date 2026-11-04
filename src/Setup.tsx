@@ -1,32 +1,37 @@
 import { useEffect, useState } from "react";
-import { CircleAlert, CircleCheck, Cloud, LoaderCircle, Wand2 } from "lucide-react";
-import { api, type BackupStatus, type Settings, type SiteDetection } from "./api";
+import { Archive, CircleAlert, CircleCheck, Cloud, LoaderCircle, Wand2 } from "lucide-react";
+import { activeProject, api, emptyProject, type BackupStatus, type Project, type Settings, type SiteDetection } from "./api";
 import { Field } from "./SettingsPage";
 
-/** First run: connect a repository, then find the live post URL. Shown until a repository is saved. */
-export function Setup({ initial, onDone }: { initial: Settings; onDone: (s: Settings) => void }) {
-  const [form, setForm] = useState(initial);
-  const [step, setStep] = useState<"repo" | "site">("repo");
+/**
+ * Connects a repository, then finds the live post URL. Shown on first run, when every project is archived,
+ * and for Add project (with `onCancel`).
+ */
+export function Setup({ settings, onDone, onCancel }: { settings: Settings; onDone: (s: Settings) => void; onCancel?: () => void }) {
+  const [form, setForm] = useState<Project>(emptyProject);
+  const [saved, setSaved] = useState<Settings | null>(null);
   const [busy, setBusy] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [error, setError] = useState("");
   const [detected, setDetected] = useState<SiteDetection | null>(null);
   const [backup, setBackup] = useState<BackupStatus | null>(null);
-  const set = (patch: Partial<Settings>) => {
+  const step = saved ? "site" : "repo";
+  const archived = settings.projects.filter((p) => p.archived);
+  const set = (patch: Partial<Project>) => {
     setForm((f) => ({ ...f, ...patch }));
     setError("");
   };
 
   useEffect(() => {
-    api.backupStatus().then(setBackup, () => {});
-  }, []);
+    if (!onCancel) api.backupStatus().then(setBackup, () => {});
+  }, [onCancel]);
 
-  async function detect(s: Settings) {
+  async function detect(p: Project) {
     setDetecting(true);
     setDetected(null);
     setError("");
     try {
-      const d = await api.detectSite(s.branch, s.postsDir);
+      const d = await api.detectSite(p.branch, p.postsDir, p.id);
       setDetected(d);
       setForm((f) => ({ ...f, postUrl: d.url }));
     } catch (e) {
@@ -40,11 +45,12 @@ export function Setup({ initial, onDone }: { initial: Settings; onDone: (s: Sett
     setBusy(true);
     setError("");
     try {
-      // Checks the repository and branch are reachable before anything is saved.
-      const saved = await api.saveSettings({ ...form, postUrl: "" });
-      setForm(saved);
-      setStep("site");
-      void detect(saved);
+      // Checks the repository and branch are reachable, then adds the project and makes it active.
+      const next = await api.addProject({ ...form, postUrl: "" });
+      const added = activeProject(next)!;
+      setSaved(next);
+      setForm(added);
+      void detect(added);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -53,19 +59,21 @@ export function Setup({ initial, onDone }: { initial: Settings; onDone: (s: Sett
   }
 
   async function finish(postUrl: string) {
+    if (!saved) return;
     setBusy(true);
     try {
-      onDone(await api.saveSettings({ ...form, postUrl }));
+      const projects = saved.projects.map((p) => (p.id === form.id ? { ...form, postUrl } : p));
+      onDone(await api.saveSettings({ ...saved, projects }));
     } catch (e) {
       setError(String(e));
       setBusy(false);
     }
   }
 
-  async function restore() {
+  async function run(f: () => Promise<Settings>) {
     setBusy(true);
     try {
-      onDone(await api.restoreBackup());
+      onDone(await f());
     } catch (e) {
       setError(String(e));
       setBusy(false);
@@ -82,6 +90,7 @@ export function Setup({ initial, onDone }: { initial: Settings; onDone: (s: Sett
           if (step === "repo") void connect();
           else void finish(form.postUrl);
         }}
+        onKeyDown={(e) => e.key === "Escape" && step === "repo" && onCancel?.()}
       >
         <div className="setup-steps">
           <span aria-current={step === "repo"}>1 · Repository</span>
@@ -90,20 +99,33 @@ export function Setup({ initial, onDone }: { initial: Settings; onDone: (s: Sett
 
         {step === "repo" ? (
           <>
-            <h1>Connect your site's repository</h1>
+            <h1>{onCancel ? "Add a project" : "Connect your site's repository"}</h1>
             <p className="muted">
-              mdwriter writes posts as Markdown in a GitHub repository and sends each one as its own pull request. It
-              works in its own clone, so your checkout is never touched.
+              {onCancel
+                ? "Each project is one repository, with its own drafts. Switch between them from the sidebar."
+                : "mdwriter writes posts as Markdown in a GitHub repository and sends each one as its own pull request. It works in its own clone, so your checkout is never touched."}
             </p>
             {backup?.restorableSettings && (
               <div className="restore">
                 <Cloud size={13} />
-                <span className="grow">Your iCloud backup has settings from another Mac.</span>
-                <button type="button" className="btn small" onClick={restore} disabled={busy}>
+                <span className="grow">Your iCloud backup has projects and settings from another Mac.</span>
+                <button type="button" className="btn small" onClick={() => run(api.restoreBackup)} disabled={busy}>
                   Restore
                 </button>
               </div>
             )}
+            {!onCancel &&
+              archived.map((p) => (
+                <div className="restore" key={p.id}>
+                  <Archive size={13} />
+                  <span className="grow">
+                    {p.repo} <span className="muted">({p.branch}) is archived</span>
+                  </span>
+                  <button type="button" className="btn small" onClick={() => run(() => api.archiveProject(p.id, false))} disabled={busy}>
+                    Unarchive
+                  </button>
+                </div>
+              ))}
             <Field label="GitHub repository" hint="owner/name. Cloned over SSH, so your SSH key needs access.">
               <input
                 autoFocus
@@ -121,6 +143,11 @@ export function Setup({ initial, onDone }: { initial: Settings; onDone: (s: Sett
             </Field>
             <div className="row settings-actions">
               <span className="grow error-text">{error}</span>
+              {onCancel && (
+                <button type="button" className="btn" onClick={onCancel} disabled={busy}>
+                  Cancel
+                </button>
+              )}
               <button type="submit" className="btn primary" disabled={busy || !form.repo.trim()}>
                 {busy && <LoaderCircle size={13} className="spin" />} {busy ? "Checking…" : "Continue"}
               </button>

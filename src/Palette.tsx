@@ -9,8 +9,8 @@ function matches(s: string, q: string) {
   return i === q.length;
 }
 
-/** ⌘K: type to filter every action and post, Enter to run. */
-export function Palette({ commands, onClose }: { commands: Cmd[]; onClose: () => void }) {
+/** Type to filter every action and post (or only projects), Enter to run. */
+export function Palette({ commands, placeholder, onClose }: { commands: Cmd[]; placeholder?: string; onClose: () => void }) {
   const [q, setQ] = useState("");
   const [i, setI] = useState(0);
   const list = useMemo(() => commands.filter((c) => matches(c.label, q.toLowerCase().replace(/\s+/g, ""))), [commands, q]);
@@ -29,7 +29,7 @@ export function Palette({ commands, onClose }: { commands: Cmd[]; onClose: () =>
       <div className="palette" onMouseDown={(e) => e.stopPropagation()}>
         <input
           autoFocus
-          placeholder="Type a command or post title"
+          placeholder={placeholder ?? "Type a command or post title"}
           value={q}
           onChange={(e) => {
             setQ(e.target.value);

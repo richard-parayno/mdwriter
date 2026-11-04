@@ -11,6 +11,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   ArrowDown,
   ArrowUp,
+  ChevronsUpDown,
   ExternalLink,
   Folder,
   GitPullRequest,
@@ -22,7 +23,7 @@ import {
   Settings as SettingsIcon,
   X,
 } from "lucide-react";
-import { api, type Commit, type Conflict, type PostFiles, type PostSummary, type Settings } from "./api";
+import { activeProject, api, setApiProject, type Commit, type Conflict, type PostFiles, type PostSummary, type Settings } from "./api";
 import { parsePost, serializePost, slugify, today, type Frontmatter, type Post } from "./frontmatter";
 import { postUrl, SettingsPage } from "./SettingsPage";
 import { livePreview } from "./livePreview";
@@ -30,6 +31,7 @@ import { changeMarkers } from "./changeMarkers";
 import { ConflictView, ReviewView } from "./DiffViews";
 import { Palette, type Cmd } from "./Palette";
 import { Setup } from "./Setup";
+import { bindings, display, fromEvent, recording, type ActionId } from "./keymap";
 
 const highlight = syntaxHighlighting(
   HighlightStyle.define([
@@ -105,13 +107,17 @@ export default function App() {
   const [since, setSince] = useState<Since | null>(null);
   const [sinceText, setSinceText] = useState<{ key: string; text: string } | null>(null);
   const [history, setHistory] = useState<Commit[]>([]);
-  const [palette, setPalette] = useState(false);
+  /** The palette, open on every command or only on projects. */
+  const [palette, setPalette] = useState<null | "all" | "projects">(null);
+  const [adding, setAdding] = useState(false);
   const [, tick] = useState(0);
 
   const view = useRef<EditorView | null>(null);
   const docRef = useRef<Post | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
   const selectedRef = useRef<string | null>(null);
+  /** The project posts are listed for; a list that comes back after a switch is dropped. */
+  const projectRef = useRef("");
 
   const summary = posts.find((p) => p.slug === selected) ?? null;
   // Locked while a git action runs, so nothing typed during a pull is lost.
@@ -123,15 +129,18 @@ export default function App() {
 
   /** Lists posts. Without `fetch` it reads local state only and returns at once. */
   const refresh = useCallback(async (fetch: boolean) => {
+    const id = projectRef.current;
+    if (!id) return [];
     if (fetch) setSyncing(true);
     try {
       const list = await api.listPosts(fetch);
+      if (projectRef.current !== id) return [];
       setPosts(list.posts);
       setWarnings(list.warnings);
       setSyncedAt(list.syncedAt);
       return list.posts;
     } catch (e) {
-      setWarnings([String(e)]);
+      if (projectRef.current === id) setWarnings([String(e)]);
       return [];
     } finally {
       if (fetch) setSyncing(false);
@@ -220,13 +229,7 @@ export default function App() {
 
   // Instant load from local state, then a read-only fetch in the background to refresh the counts.
   useEffect(() => {
-    api.getSettings().then(setSettings, (e) => setWarnings([String(e)]));
-    refresh(false).then(async (list) => {
-      setLoaded(true);
-      const first = [...list].sort(byStatus)[0];
-      if (first) await select(first.slug, list);
-      refresh(true);
-    });
+    api.getSettings().then((s) => void showProject(s), (e) => setWarnings([String(e)]));
     const id = window.setInterval(() => tick((n) => n + 1), 30_000);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -406,20 +409,59 @@ export default function App() {
     await select(slug, list);
   }
 
-  async function settingsSaved(next: Settings) {
+  /** Shows the settings' active project: lists its posts from local state at once, then fetches. */
+  async function showProject(next: Settings) {
+    const id = activeProject(next)?.id ?? "";
+    const same = id === projectRef.current;
+    if (!same) await flushSave();
     setSettings(next);
-    setShowSettings(false);
-    const list = await refresh(true);
-    const keep = list.find((p) => p.slug === selectedRef.current) ?? [...list].sort(byStatus)[0];
+    setAdding(false);
+    projectRef.current = id;
+    setApiProject(id);
+    if (!same) {
+      setSelected(null);
+      selectedRef.current = null;
+      setDoc(null);
+      setPosts([]);
+      setWarnings([]);
+      setSyncedAt(null);
+      setConflict(null);
+      setReview(null);
+      setSince(null);
+      setLoaded(false);
+    }
+    const list = await refresh(false);
+    if (projectRef.current !== id) return;
+    setLoaded(true);
+    const keep = (same && list.find((p) => p.slug === selectedRef.current)) || [...list].sort(byStatus)[0];
     if (keep) await select(keep.slug, list);
     else {
       setSelected(null);
       setDoc(null);
     }
+    refresh(true);
   }
 
-  const branch = settings?.branch ?? "main";
-  const postsDir = settings?.postsDir ?? "src/content/posts";
+  async function settingsSaved(next: Settings) {
+    setShowSettings(false);
+    await showProject(next);
+  }
+
+  async function switchProject(id: string) {
+    if (id === projectRef.current) return;
+    setShowSettings(false);
+    try {
+      await flushSave();
+      await showProject(await api.switchProject(id));
+    } catch (e) {
+      setToast({ text: String(e), tone: "error" });
+    }
+  }
+
+  const project = activeProject(settings);
+  const projects = settings?.projects.filter((p) => !p.archived) ?? [];
+  const branch = project?.branch ?? "main";
+  const postsDir = project?.postsDir ?? "src/content/posts";
   const sorted = useMemo(() => [...posts].sort(byStatus), [posts]);
   const filesDir = files?.dir;
   const markerBody = sinceDoc?.body;
@@ -465,25 +507,38 @@ export default function App() {
 
   // ---------- commands and shortcuts ----------
 
+  const keys = bindings(settings);
   const slug = summary?.slug;
   const commands: Cmd[] = [];
-  const add = (c: Omit<Cmd, "id"> & { id?: string }, when = true) => when && commands.push({ ...c, id: c.id ?? c.label });
+  const add = (c: Omit<Cmd, "id"> & { id?: string; action?: ActionId }, when = true) =>
+    when && commands.push({ ...c, id: c.id ?? c.label, shortcut: c.action ? display(keys[c.action]) : undefined });
   if (slug && summary?.local && !busy) {
-    add({ group: "Post", label: "Pull", shortcut: "⌘⇧L", run: () => void pull(slug) }, !summary.conflict);
-    add({ group: "Post", label: "Push", shortcut: "⌘⇧P", run: () => void push(slug) }, canPush);
-    add({ group: "Post", label: "Open PR", run: () => void openPr(slug) }, canOpenPr);
-    add({ group: "Post", label: "Review changes", run: () => void reviewChanges(slug) }, !!sync?.changes);
+    add({ group: "Post", label: "Pull", action: "pull", run: () => void pull(slug) }, !summary.conflict);
+    add({ group: "Post", label: "Push", action: "push", run: () => void push(slug) }, canPush);
+    add({ group: "Post", label: "Open PR", action: "openPr", run: () => void openPr(slug) }, canOpenPr);
+    add({ group: "Post", label: "Review changes", action: "review", run: () => void reviewChanges(slug) }, !!sync?.changes);
     add({ group: "Post", label: "Undo last pull", run: () => void undo(slug) });
-    add({ group: "Post", label: since ? "Hide change markers" : "Show changes since last sync", shortcut: "⌘⇧D", run: () => toggleMarkers() });
+    add({ group: "Post", label: since ? "Hide change markers" : "Show changes since last sync", action: "markers", run: () => toggleMarkers() });
     add({ group: "Post", label: `Show changes since ${branch}`, run: () => setSince({ rev: "main", label: branch }) }, summary.onMain);
   }
   if (slug && summary && !summary.local && !busy) add({ group: "Post", label: "Edit as draft", run: () => void edit(slug) });
   if (summary?.pr) add({ group: "Post", label: `View PR #${summary.pr.number} on GitHub`, run: () => open(summary.pr!.url) });
-  const site = summary && summary.onMain && !fm?.draft ? postUrl(settings, summary.slug) : null;
+  const site = summary && summary.onMain && !fm?.draft ? postUrl(project, summary.slug) : null;
   if (site) add({ group: "Post", label: "Open on site", run: () => open(site) });
-  add({ group: "App", label: "New post", shortcut: "⌘N", run: () => setCreating(true) });
-  add({ group: "App", label: "Sync with GitHub", shortcut: "⌘R", run: () => void refresh(true) });
-  add({ group: "App", label: "Settings", shortcut: "⌘,", run: () => setShowSettings(true) }, !!settings);
+  add({ group: "App", label: "New post", action: "newPost", run: () => setCreating(true) });
+  add({ group: "App", label: "Sync with GitHub", action: "sync", run: () => void refresh(true) });
+  add({ group: "App", label: "Settings", action: "settings", run: () => setShowSettings(true) }, !!settings);
+  const projectCommands: Cmd[] = [
+    ...projects.map((p) => ({
+      id: `project:${p.id}`,
+      group: "Project",
+      label: `Switch to ${p.repo}${projects.some((q) => q !== p && q.repo === p.repo) ? ` (${p.branch})` : ""}`,
+      shortcut: p.id === project?.id ? "Current" : undefined,
+      run: () => void switchProject(p.id),
+    })),
+    { id: "project:add", group: "Project", label: "Add project…", run: () => void flushSave().then(() => setAdding(true)) },
+  ];
+  commands.push(...projectCommands);
   for (const p of sorted) {
     add({ id: `go:${p.slug}`, group: "Go to", label: liveTitle(p), run: () => (setShowSettings(false), void select(p.slug)) });
   }
@@ -492,25 +547,31 @@ export default function App() {
     setSince((s) => (s ? null : { rev: "base", label: "last sync" }));
   }
 
-  const keys = useRef<Record<string, () => void>>({});
-  keys.current = {
-    k: () => setPalette((p) => !p),
-    "shift+p": () => slug && canPush && void push(slug),
-    "shift+l": () => slug && summary?.local && !busy && !summary.conflict && void pull(slug),
-    "shift+d": () => summary?.local && toggleMarkers(),
-    n: () => setCreating(true),
-    r: () => void refresh(true),
-    ",": () => settings && setShowSettings(true),
+  const handlers = useRef<Record<ActionId, () => void>>(null!);
+  handlers.current = {
+    palette: () => setPalette((p) => (p ? null : "all")),
+    switchProject: () => setPalette((p) => (p ? null : "projects")),
+    newPost: () => project && setCreating(true),
+    sync: () => void refresh(true),
+    settings: () => settings && setShowSettings(true),
+    pull: () => slug && summary?.local && !busy && !summary.conflict && void pull(slug),
+    push: () => slug && canPush && !busy && void push(slug),
+    openPr: () => slug && canOpenPr && !busy && void openPr(slug),
+    review: () => slug && sync?.changes && void reviewChanges(slug),
+    markers: () => summary?.local && toggleMarkers(),
   };
+  const keysRef = useRef(keys);
+  keysRef.current = keys;
   useEffect(() => {
     // Capture phase, so the editor's own Mod-Shift-L and friends don't see these.
     const onKey = (e: KeyboardEvent) => {
-      if (!e.metaKey || e.altKey || e.ctrlKey) return;
-      const f = keys.current[(e.shiftKey ? "shift+" : "") + e.key.toLowerCase()];
-      if (!f) return;
+      if (recording.current) return;
+      const pressed = fromEvent(e);
+      const action = pressed && (Object.keys(keysRef.current) as ActionId[]).find((a) => keysRef.current[a] === pressed);
+      if (!action) return;
       e.preventDefault();
       e.stopPropagation();
-      f();
+      handlers.current[action]();
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
@@ -522,7 +583,7 @@ export default function App() {
     if (showSettings && settings)
       return <SettingsPage key={JSON.stringify(settings)} settings={settings} onSaved={settingsSaved} onClose={() => setShowSettings(false)} />;
     if (!doc || !fm || !summary)
-      return <div className="empty">{loaded ? "Select a post or create one with ⌘N" : "Loading posts…"}</div>;
+      return <div className="empty">{loaded ? `Select a post or create one${keys.newPost ? ` with ${display(keys.newPost)}` : ""}` : "Loading posts…"}</div>;
     if (conflict && summary.conflict && files)
       return (
         <ConflictView
@@ -601,22 +662,31 @@ export default function App() {
     );
   };
 
-  // First run: nothing works without a repository, so ask for one before showing the app.
-  if (settings && !settings.repo) return <Setup initial={settings} onDone={settingsSaved} />;
+  // First run, or every project archived: nothing works without a repository, so ask for one first.
+  if (settings && (!project || adding))
+    return <Setup settings={settings} onDone={settingsSaved} onCancel={project ? () => setAdding(false) : undefined} />;
 
   return (
     <div className="app">
       <aside className="side">
         <div className="drag" data-tauri-drag-region />
         <div className="side-head">
-          <span className="label">Posts</span>
+          <button
+            className="project-btn"
+            title={hint("Switch project", keys.switchProject)}
+            onClick={() => setPalette("projects")}
+          >
+            <span className="project-name">{project?.repo.split("/")[1] ?? "mdwriter"}</span>
+            {project && projects.filter((p) => p.repo === project.repo).length > 1 && <span className="muted">{project.branch}</span>}
+            <ChevronsUpDown size={12} className="muted" />
+          </button>
           <div className="row">
-            <button className="icon-btn" title="New post (⌘N)" onClick={() => setCreating((c) => !c)}>
+            <button className="icon-btn" title={hint("New post", keys.newPost)} onClick={() => setCreating((c) => !c)}>
               <Plus size={14} />
             </button>
             <button
               className="icon-btn"
-              title="Settings (⌘,)"
+              title={hint("Settings", keys.settings)}
               aria-pressed={showSettings}
               onClick={() => setShowSettings((s) => !s)}
               disabled={!settings}
@@ -678,11 +748,11 @@ export default function App() {
             {warnings[0]}
           </div>
         )}
-        <button className="side-foot" title="Fetch from GitHub (⌘R). Only updates the counts; drafts never change." onClick={() => refresh(true)} disabled={syncing}>
+        <button className="side-foot" title={hint("Fetch from GitHub. Only updates the counts; drafts never change.", keys.sync)} onClick={() => refresh(true)} disabled={syncing}>
           <RefreshCw size={12} className={syncing ? "spin" : ""} />
           {syncing ? "Syncing…" : ago(syncedAt)}
           <span className="spacer" />
-          <kbd>⌘K</kbd>
+          {keys.palette && <kbd>{display(keys.palette)}</kbd>}
         </button>
       </aside>
 
@@ -726,7 +796,7 @@ export default function App() {
             {summary.local && !summary.conflict && (
               <select
                 className="since"
-                title="Mark lines changed since a commit (⌘⇧D)"
+                title={hint("Mark lines changed since a commit", keys.markers)}
                 value={since?.rev ?? ""}
                 onFocus={loadHistory}
                 onMouseDown={loadHistory}
@@ -755,13 +825,13 @@ export default function App() {
                 )}
                 <button
                   className={`btn ${pullFirst ? "primary" : ""}`}
-                  title="Fetch and merge remote changes into the draft (⌘⇧L)"
+                  title={hint("Fetch and merge remote changes into the draft", keys.pull)}
                   onClick={() => pull(summary.slug)}
                   disabled={busy}
                 >
                   <ArrowDown size={13} /> Pull{sync?.behind ? ` ${sync.behind}` : ""}
                 </button>
-                <button className={`btn ${canPush ? "primary" : ""}`} title={`${pushWhy} (⌘⇧P)`} onClick={() => push(summary.slug)} disabled={busy || !canPush}>
+                <button className={`btn ${canPush ? "primary" : ""}`} title={hint(pushWhy, keys.push)} onClick={() => push(summary.slug)} disabled={busy || !canPush}>
                   <ArrowUp size={13} /> Push
                 </button>
                 {canOpenPr && (
@@ -803,7 +873,13 @@ export default function App() {
           )}
         </div>
       )}
-      {palette && <Palette commands={commands} onClose={() => setPalette(false)} />}
+      {palette && (
+        <Palette
+          commands={palette === "projects" ? projectCommands : commands}
+          placeholder={palette === "projects" ? "Switch to project" : undefined}
+          onClose={() => setPalette(null)}
+        />
+      )}
     </div>
   );
 }
@@ -849,6 +925,11 @@ function Tags({ value, readOnly, onChange }: { value: string[]; readOnly: boolea
       )}
     </div>
   );
+}
+
+/** A tooltip with the shortcut, when the action has one. */
+function hint(text: string, binding: string) {
+  return binding ? `${text} (${display(binding)})` : text;
 }
 
 function byStatus(a: PostSummary, b: PostSummary) {
