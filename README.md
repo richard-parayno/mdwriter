@@ -14,50 +14,7 @@ Built with Tauri v2, React and CodeMirror.
 
 Everything you write stays on your Mac until you choose an action. The app works in its own clone of your repository, never in your checkout, and only talks to the remote through `git` and the GitHub CLI.
 
-```text
- YOUR MAC
-┌──────────────────────────────────────────────────────────────────────────┐
-│ mdwriter.app                                                             │
-│                                                                          │
-│   Webview: React + CodeMirror                                            │
-│   editor, live preview, diffs, change markers, command palette           │
-│          │                                         ▲                     │
-│          │ Tauri commands                          │ results             │
-│          ▼                                         │                     │
-│   Rust backend: src-tauri/src/lib.rs, git logic in sync.rs               │
-│                                                                          │
-└───────┬───────────────────────────┬────────────────────────┬─────────────┘
-        │ read and write            │ git, gh                │ copy, if on
-        ▼                           ▼                        ▼
-┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
-│ App data folder      │  │ App-owned clones     │  │ iCloud Drive         │
-│                      │  │                      │  │                      │
-│ settings.json        │  │ projects/<id>/repo/  │  │ mdwriter/            │
-│ projects/<id>/       │  │ one per project;     │  │ drafts and settings, │
-│   drafts/<slug>/     │  │ commits only the     │  │ restorable on        │
-│     index.md, images │  │ post's folder        │  │ another Mac          │
-│     .base/ (synced)  │  │                      │  │                      │
-│   sync.json (PRs)    │  │                      │  │                      │
-└──────────────────────┘  └───────────┬──────────┘  └──────────────────────┘
-                                      │
-══════════════════════════════════════│══════════════════════════ network ══
- REMOTE                               │
-             git fetch: reads only    │    git push --force-with-lease
-             gh pr list, gh pr create │    to post/<slug>
-                                      ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ GitHub repository                                                        │
-│                                                                          │
-│   post/<slug>  ── pull request ──▶  main (or your configured branch)     │
-└───────────────────────────────────────────────────┬──────────────────────┘
-                                                    │ your host builds the
-                                                    ▼ branch and deploys it
-                                         ┌──────────────────────┐
-                                         │ Live site            │
-                                         │ opened by the Site   │
-                                         │ button               │
-                                         └──────────────────────┘
-```
+![mdwriter architecture: the app on your Mac keeps drafts in its app data folder, works in its own clone of your repository, optionally backs up to iCloud Drive, and pushes each post as its own post branch that becomes a pull request into main on GitHub](docs/architecture.svg)
 
 Three rules keep local and remote from overwriting each other:
 
@@ -168,3 +125,7 @@ mdwriter treats the repository and the iCloud backup as untrusted input:
 - Links open only `http`, `https`, `mailto` and `tel` URLs.
 
 The git logic is in `src-tauri/src/sync.rs`. Its tests run each guarantee against a local bare repository: `cargo test --lib` in `src-tauri/`.
+
+## License
+
+[MIT](LICENSE)

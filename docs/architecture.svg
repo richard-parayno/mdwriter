@@ -1,0 +1,134 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 820" width="960" height="820" role="img" aria-labelledby="title desc">
+  <title id="title">mdwriter architecture</title>
+  <desc id="desc">The mdwriter app on your Mac has a React and CodeMirror webview that calls a Rust backend through Tauri commands. The backend reads and writes the app data folder, runs git and gh in app-owned clones, and optionally copies drafts to iCloud Drive. Across the network, the clones fetch from and push post branches to the GitHub repository, where a pull request merges post/slug into main, and your host deploys main to the live site.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .panel { fill: #f6f8fa; stroke: #d0d7de; }
+    .box { fill: #ffffff; stroke: #d0d7de; }
+    .app { fill: #f3f8ff; stroke: #0969da; }
+    .optional { fill: #ffffff; stroke: #8c959f; stroke-dasharray: 6 4; }
+    .pill { fill: #ffffff; stroke: #0969da; }
+    .site { fill: #dafbe1; stroke: #1a7f37; }
+    .t { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2328; }
+    .m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1f2328; font-size: 12.5px; }
+    .h { font-size: 15px; font-weight: 600; }
+    .s { font-size: 13px; fill: #59636e; }
+    .label { font-size: 12px; fill: #59636e; }
+    .zone { font-size: 11.5px; font-weight: 700; letter-spacing: 1.5px; fill: #59636e; }
+    .accent { fill: #0969da; }
+    .arrow { stroke: #59636e; stroke-width: 1.5; fill: none; }
+    .head { fill: #59636e; }
+    .net { stroke: #8c959f; stroke-width: 1.5; stroke-dasharray: 2 5; stroke-linecap: round; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .panel { fill: #151b23; stroke: #3d444d; }
+      .box, .optional { fill: #0d1117; stroke: #3d444d; }
+      .optional { stroke: #656c76; }
+      .app { fill: #0c1d33; stroke: #4493f8; }
+      .pill { fill: #0d1117; stroke: #4493f8; }
+      .site { fill: #0f2a19; stroke: #3fb950; }
+      .t, .m { fill: #e6edf3; }
+      .s, .label, .zone { fill: #9198a1; }
+      .accent { fill: #4493f8; }
+      .arrow { stroke: #9198a1; }
+      .head { fill: #9198a1; }
+      .net { stroke: #656c76; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path class="head" d="M0 0 L10 5 L0 10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="960" height="820" rx="16"/>
+
+  <!-- Your Mac -->
+  <rect class="panel" x="20" y="20" width="920" height="440" rx="12"/>
+  <text class="t zone" x="44" y="48">YOUR MAC</text>
+
+  <rect class="app" x="44" y="64" width="872" height="150" rx="10"/>
+  <text class="t h accent" x="64" y="91">mdwriter.app</text>
+
+  <rect class="box" x="64" y="106" width="340" height="90" rx="8"/>
+  <text class="t h" x="84" y="132">Webview<tspan class="t s" dx="10">React + CodeMirror</tspan></text>
+  <text class="t s" x="84" y="158">Editor, live preview, diffs,</text>
+  <text class="t s" x="84" y="178">change markers, command palette</text>
+
+  <rect class="box" x="556" y="106" width="340" height="90" rx="8"/>
+  <text class="t h" x="576" y="132">Rust backend</text>
+  <text class="m" x="576" y="158">src-tauri/src/lib.rs</text>
+  <text class="t s" x="576" y="178">git logic in <tspan class="m">sync.rs</tspan></text>
+
+  <path class="arrow" d="M408 138 H550" marker-end="url(#a)"/>
+  <text class="t label" x="480" y="130" text-anchor="middle">Tauri commands</text>
+  <path class="arrow" d="M552 166 H410" marker-end="url(#a)"/>
+  <text class="t label" x="480" y="184" text-anchor="middle">results</text>
+
+  <!-- Backend to storage -->
+  <path class="arrow" d="M180 214 V254" marker-end="url(#a)"/>
+  <text class="t label" x="190" y="239">read and write</text>
+  <path class="arrow" d="M480 214 V254" marker-end="url(#a)"/>
+  <text class="t label" x="490" y="239"><tspan class="m">git</tspan>, <tspan class="m">gh</tspan></text>
+  <path class="arrow" d="M780 214 V254" marker-end="url(#a)"/>
+  <text class="t label" x="790" y="239">copy, if backup is on</text>
+
+  <rect class="box" x="44" y="260" width="272" height="176" rx="8"/>
+  <text class="t h" x="64" y="287">App data folder</text>
+  <text class="m" x="64" y="314">settings.json</text>
+  <text class="m" x="64" y="336">projects/&lt;id&gt;/</text>
+  <text class="m" x="80" y="358">drafts/&lt;slug&gt;/</text>
+  <text class="m" x="96" y="380">index.md, images</text>
+  <text class="m" x="96" y="402">.base/ <tspan class="t s">last synced</tspan></text>
+  <text class="m" x="80" y="424">sync.json <tspan class="t s">open PRs</tspan></text>
+
+  <rect class="box" x="344" y="260" width="272" height="176" rx="8"/>
+  <text class="t h" x="364" y="287">App-owned clones</text>
+  <text class="m" x="364" y="314">projects/&lt;id&gt;/repo/</text>
+  <text class="t s" x="364" y="342">One per project, never your</text>
+  <text class="t s" x="364" y="362">own checkout. Commits only</text>
+  <text class="t s" x="364" y="382">the post's folder.</text>
+
+  <rect class="optional" x="644" y="260" width="272" height="176" rx="8"/>
+  <text class="t h" x="664" y="287">iCloud Drive<tspan class="t s" dx="10">optional</tspan></text>
+  <text class="m" x="664" y="314">mdwriter/</text>
+  <text class="t s" x="664" y="342">Drafts and settings, in the</text>
+  <text class="t s" x="664" y="362">same layout. Restorable on</text>
+  <text class="t s" x="664" y="382">another Mac.</text>
+
+  <!-- Network -->
+  <line class="net" x1="20" y1="500" x2="940" y2="500"/>
+  <rect class="bg" x="850" y="490" width="80" height="20"/>
+  <text class="t zone" x="890" y="504" text-anchor="middle">NETWORK</text>
+
+  <!-- GitHub -->
+  <rect class="panel" x="20" y="540" width="920" height="130" rx="12"/>
+  <text class="t zone" x="44" y="568">GITHUB REPOSITORY</text>
+
+  <rect class="pill" x="360" y="580" width="240" height="56" rx="28"/>
+  <text class="m" x="480" y="613" text-anchor="middle" style="font-size:14px">post/&lt;slug&gt;</text>
+  <text class="t s" x="480" y="656" text-anchor="middle">one branch per post</text>
+
+  <path class="arrow" d="M604 608 H694" marker-end="url(#a)"/>
+  <text class="t label" x="649" y="598" text-anchor="middle">pull request</text>
+
+  <rect class="pill" x="700" y="580" width="200" height="56" rx="28"/>
+  <text class="m" x="800" y="613" text-anchor="middle" style="font-size:14px">main</text>
+  <text class="t s" x="800" y="656" text-anchor="middle">or your configured branch</text>
+
+  <path class="arrow" d="M455 580 V442" marker-end="url(#a)"/>
+  <text class="t label" x="443" y="478" text-anchor="end"><tspan class="m">git fetch</tspan> (reads only)</text>
+  <text class="t label" x="443" y="532" text-anchor="end"><tspan class="m">gh pr list</tspan></text>
+  <path class="arrow" d="M505 436 V574" marker-end="url(#a)"/>
+  <text class="t label" x="517" y="478"><tspan class="m">git push --force-with-lease</tspan></text>
+  <text class="t label" x="517" y="532"><tspan class="m">gh pr create</tspan></text>
+
+
+  <!-- Deploy -->
+  <path class="arrow" d="M800 670 V714" marker-end="url(#a)"/>
+  <text class="t label" x="788" y="697" text-anchor="end">your host builds and deploys it</text>
+
+  <rect class="site" x="700" y="720" width="200" height="72" rx="10"/>
+  <text class="t h" x="800" y="750" text-anchor="middle">Live site</text>
+  <text class="t s" x="800" y="772" text-anchor="middle">opened by the Site button</text>
+</svg>

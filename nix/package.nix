@@ -89,6 +89,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
   meta = {
     description = "Write Markdown posts for a git-based site, with each post sent as its own pull request";
     homepage = "https://github.com/richard-parayno/mdwriter";
+    license = lib.licenses.mit;
     mainProgram = "mdwriter";
     platforms = [ "x86_64-linux" ];
   };
