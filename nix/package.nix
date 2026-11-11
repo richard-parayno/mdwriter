@@ -1,18 +1,17 @@
 {
   lib,
   rustPlatform,
-  fetchPnpmDeps,
-  pnpmConfigHook,
-  pnpm_12,
-  nodejs,
-  cargo-tauri,
   pkg-config,
-  wrapGAppsHook3,
-  glib-networking,
-  gtk3,
-  libsoup_3,
-  openssl,
-  webkitgtk_4_1,
+  makeWrapper,
+  fontconfig,
+  libxkbcommon,
+  wayland,
+  vulkan-loader,
+  libGL,
+  libx11,
+  libxcursor,
+  libxi,
+  libxrandr,
   git,
   gh,
   curl,
@@ -20,52 +19,47 @@
 }:
 
 let
-  root = ../.;
+  # winit and wgpu load these at run time with dlopen, so they aren't in the binary's RPATH.
+  runtimeLibs = [
+    libxkbcommon
+    wayland
+    vulkan-loader
+    libGL
+    libx11
+    libxcursor
+    libxi
+    libxrandr
+  ];
 in
-rustPlatform.buildRustPackage (finalAttrs: {
+rustPlatform.buildRustPackage {
   pname = "mdwriter";
-  version = (lib.importJSON ../src-tauri/tauri.conf.json).version;
+  version = (lib.importTOML ../Cargo.toml).package.version;
 
   src = lib.fileset.toSource {
-    inherit root;
+    root = ../.;
     fileset = lib.fileset.unions [
-      ../index.html
-      ../package.json
-      ../pnpm-lock.yaml
-      ../pnpm-workspace.yaml
-      ../tsconfig.json
-      ../vite.config.ts
+      ../Cargo.toml
+      ../Cargo.lock
       ../src
-      (lib.fileset.difference ../src-tauri (lib.fileset.maybeMissing ../src-tauri/target))
+      ../assets
     ];
   };
 
-  cargoRoot = "src-tauri";
-  buildAndTestSubdir = finalAttrs.cargoRoot;
-  cargoLock.lockFile = ../src-tauri/Cargo.lock;
-
-  pnpmDeps = fetchPnpmDeps {
-    inherit (finalAttrs) pname version src;
-    pnpm = pnpm_12;
-    fetcherVersion = 5;
-    hash = "sha256-eKINfkjfXurAYEuCLPz1v8JUe+e/fr6VvMPbfkR6H4w=";
+  cargoLock = {
+    lockFile = ../Cargo.lock;
+    # Rune is a git dependency pinned by commit in Cargo.lock.
+    allowBuiltinFetchGit = true;
   };
 
   nativeBuildInputs = [
-    cargo-tauri.hook
-    nodejs
-    pnpm_12
-    pnpmConfigHook
     pkg-config
-    wrapGAppsHook3
+    makeWrapper
   ];
 
   buildInputs = [
-    glib-networking
-    gtk3
-    libsoup_3
-    openssl
-    webkitgtk_4_1
+    fontconfig
+    libxkbcommon
+    wayland
   ];
 
   # The sync tests drive real git against bare repositories in a temp dir.
@@ -76,14 +70,12 @@ rustPlatform.buildRustPackage (finalAttrs: {
     git config --global user.email nix@localhost
     git config --global init.defaultBranch main
   '';
-  cargoTestFlags = [ "--lib" ];
 
-  preFixup = ''
+  postFixup = ''
     # mdwriter shells out to git (over SSH), gh and curl.
-    gappsWrapperArgs+=(
-      --prefix PATH : ${lib.makeBinPath [ git gh curl openssh ]}
-      --set-default WEBKIT_DISABLE_DMABUF_RENDERER 1
-    )
+    wrapProgram $out/bin/mdwriter \
+      --prefix PATH : ${lib.makeBinPath [ git gh curl openssh ]} \
+      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath runtimeLibs}
   '';
 
   meta = {
@@ -93,4 +85,4 @@ rustPlatform.buildRustPackage (finalAttrs: {
     mainProgram = "mdwriter";
     platforms = [ "x86_64-linux" ];
   };
-})
+}

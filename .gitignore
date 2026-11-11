@@ -1,10 +1,8 @@
-node_modules/
-dist/
-src-tauri/target/
-src-tauri/gen/schemas/
+target/
 .DS_Store
 .devenv/
 .devenv.flake.nix
 .direnv/
 result
 .amp/portals/*
+.amp/in/

@@ -1,4 +1,4 @@
-//! Git sync for drafts. Nothing here knows about Tauri, so the tests can run it against a local bare repository.
+//! Git sync for drafts. Nothing here knows about the UI, so the tests can run it against a local bare repository.
 //!
 //! A draft folder holds the post's files plus two hidden entries:
 //! - `.base/`: the files as they were the last time the draft matched the remote. Pull merges against it, and
@@ -655,10 +655,13 @@ mod tests {
 
     impl World {
         fn new(name: &str) -> World {
-            std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
-            std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
-            for (k, v) in [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")] {
-                std::env::set_var(k, v);
+            // Every test sets the same values, so concurrent writes can't change what a reader sees.
+            unsafe {
+                std::env::set_var("GIT_CONFIG_GLOBAL", "/dev/null");
+                std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+                for (k, v) in [("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"), ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")] {
+                    std::env::set_var(k, v);
+                }
             }
             let root = std::env::temp_dir().join(format!("mdwriter-test-{name}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&root);

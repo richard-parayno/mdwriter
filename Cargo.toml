@@ -1,0 +1,29 @@
+[package]
+name = "mdwriter"
+version = "0.2.0"
+license = "MIT"
+edition = "2024"
+rust-version = "1.99"
+description = "A desktop app for writing Markdown blog posts that live in a GitHub repository"
+
+[dependencies]
+# Rune is pre-release; pin a commit of its `dev` branch.
+rune = { git = "https://github.com/anomalyco/rune", rev = "bba30a61cfcec6683e3fdedf156a92dae89d8b04", features = ["native-file-dialog"] }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "bba30a61cfcec6683e3fdedf156a92dae89d8b04", features = ["markdown"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml_ng = "0.10"
+unicode-normalization = "0.1"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# Full debug info for Rune makes a debug build need many GB of RAM; line tables keep backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

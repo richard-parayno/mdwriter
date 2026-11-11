@@ -4,11 +4,11 @@ A macOS writing app for Markdown posts that live in a git repository. You write 
 
 It's built for people who already run their site from a git repository, with a branch that deploys and pull requests as the way changes get in. [Astro](https://astro.build) content collections are a first-class target, but any repository that keeps posts as Markdown files in one folder works.
 
-Built with Tauri v2, React and CodeMirror.
+Built in Rust with [Rune](https://github.com/anomalyco/rune), a GPU-rendered UI framework. There is no webview: the app draws its own window, and the git and GitHub logic runs in the same process.
 
 ![mdwriter editing a post with live preview and change markers](docs/screenshot.png)
 
-*A draft in live preview, with change markers since the last sync: a changed line in blue, an added line in green, and the changed `tags` field marked.*
+*A draft in live preview, with change markers since the last sync: a changed line in blue, an added line in green, the changed `description` and `tags` fields marked, and a marker's popup showing the old text with Revert.*
 
 ## Architecture
 
@@ -25,23 +25,35 @@ Three rules keep local and remote from overwriting each other:
 ## Requirements
 
 - macOS. Linux builds through Nix too (below), but iCloud backup is macOS only.
-- Rust, the Tauri CLI, Node and pnpm, to build it. `.tool-versions` pins them for [mise](https://mise.jdx.dev): run `mise install`.
+- Rust, to build it. `.tool-versions` pins the version for [mise](https://mise.jdx.dev): run `mise install`. On Linux the build also needs `libxkbcommon-dev`, `libwayland-dev` and `libfontconfig1-dev` (Debian names), and a Vulkan driver to run.
 - `git` with SSH access to your repository on GitHub
 - The GitHub CLI, `gh`, logged in
 
 ## Run
 
 ```sh
-mise install         # Rust, Node, pnpm and tauri-cli at the pinned versions
-pnpm install
-cargo tauri dev      # development, with hot reload
-cargo tauri build    # builds src-tauri/target/release/bundle/macos/mdwriter.app
-pnpm release         # builds, installs to /Applications, and restarts mdwriter if it was open
+mise install          # Rust at the pinned version
+cargo run            # development build
+cargo test           # the git, frontmatter, keymap and editor tests
+scripts/release.sh   # builds mdwriter.app, installs it to /Applications, and restarts mdwriter if it was open
 ```
+
+Rune is pre-release, so `Cargo.toml` pins one commit of its `dev` branch. It has no bundler: `scripts/release.sh` assembles `mdwriter.app` from the release binary, the icon and an `Info.plist`, and signs it ad hoc.
+
+### Headless rendering
+
+Rune can draw the app without a window, which is how the UI is checked in CI or a container. `src/demo.rs` defines fixture scenes (`editor`, `source`, `markers`, `palette`, `readonly`, `setup`, `settings`, `review`, `conflict`) that never touch your data or the network:
+
+```sh
+cargo run -- --snap out.png --scene markers --size 1100x720 --theme dark
+cargo run -- --script input.json --snap out.png --tree out.json --at 2 --scene editor
+```
+
+`--script` replays taps, keys and typed text from a JSON file, and `--tree` dumps the element tree. Without a GPU, install a software Vulkan driver (`mesa-vulkan-drivers`). Set `MDWRITER_DATA_DIR` to run the real app against a different data folder.
 
 ### NixOS
 
-`devenv.nix` is a development shell for x86_64 Linux with the GTK and WebKitGTK libraries Tauri needs: run `devenv shell`, then `pnpm install` and `cargo tauri dev`.
+`devenv.nix` is a development shell for x86_64 Linux with the Wayland, X11 and Vulkan libraries Rune loads: run `devenv shell`, then `cargo run`.
 
 `flake.nix` packages the app for x86_64-linux:
 
@@ -57,7 +69,7 @@ nixpkgs.overlays = [ mdwriter.overlays.default ];
 environment.systemPackages = [ pkgs.mdwriter ];
 ```
 
-The package puts `git`, `gh`, `curl` and `openssh` on the app's `PATH`. After changing JavaScript dependencies, update the `hash` in `nix/package.nix`: build once, and Nix prints the new one.
+The package puts `git`, `gh`, `curl` and `openssh` on the app's `PATH`. Rune is fetched as a git dependency at the commit in `Cargo.lock`.
 
 ## Setup
 
@@ -93,7 +105,7 @@ Each repository you write for is a project, with its own clone, drafts and setti
 
 To change one, open **Settings › Keyboard shortcuts**, click its shortcut and press the new keys. Backspace removes a shortcut and Escape cancels. The reset button beside a changed shortcut restores its default.
 
-A shortcut needs ⌘ or ⌃ (or an F key), so it can't catch ordinary typing. Two actions can't share one. ⌘Q, ⌘W, ⌘H, ⌘M and the editing shortcuts (⌘A, ⌘C, ⌘V, ⌘X, ⌘Z, ⌘⇧Z) stay reserved. Changes are saved in `settings.json` under `keybinds`, and only the ones that differ from the defaults are stored. The actions and defaults are defined in `src/keymap.ts`.
+A shortcut needs ⌘ or ⌃ (or an F key), so it can't catch ordinary typing. Two actions can't share one. ⌘Q, ⌘W, ⌘H, ⌘M and the editing shortcuts (⌘A, ⌘C, ⌘V, ⌘X, ⌘Z, ⌘⇧Z) stay reserved. Changes are saved in `settings.json` under `keybinds`, and only the ones that differ from the defaults are stored. The actions and defaults are defined in `src/keymap.rs`.
 
 ## Astro support
 
@@ -121,10 +133,14 @@ mdwriter treats the repository and the iCloud backup as untrusted input:
 
 - Clones check out symbolic links as plain files (`core.symlinks=false`), and Push, Pull and backup refuse to read or write through a link. A post can't make the app write outside its own folders.
 - Slugs, project ids, branches, revisions and folders are checked before they reach `git`. Detect site accepts only an `http(s)` `site` and passes it to `curl` with `--url` and `--proto =http,https`.
-- The webview has a content security policy, and can load local files only from draft and conflict folders.
-- Links open only `http`, `https`, `mailto` and `tel` URLs.
+- There is no webview and nothing in a post is executed: Markdown is drawn as styled text. Image previews load only files beside the draft, never a URL or a path outside its folder.
+- Links open only `http`, `https` and `mailto` URLs.
 
-The git logic is in `src-tauri/src/sync.rs`. Its tests run each guarantee against a local bare repository: `cargo test --lib` in `src-tauri/`.
+The git logic is in `src/sync.rs`. Its tests run each guarantee against a local bare repository: `cargo test`.
+
+## Editor notes
+
+The editor is one Rune text field holding the post's Markdown. Live preview restyles it instead of replacing it: `src/md.rs` finds the syntax (`**`, `#`, link URLs), and those characters are drawn at near-zero size except on the line with the caret. Rune's text decorations can't insert widgets into text, so an image on its own line is previewed below the text with its line number rather than inline. Rune lays the whole field out again on each keystroke, so typing gets slower in very long posts (Rune's own notes measure about 12 ms per key at 50 KB).
 
 ## License
 

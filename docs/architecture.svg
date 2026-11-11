@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 820" width="960" height="820" role="img" aria-labelledby="title desc">
   <title id="title">mdwriter architecture</title>
-  <desc id="desc">The mdwriter app on your Mac has a React and CodeMirror webview that calls a Rust backend through Tauri commands. The backend reads and writes the app data folder, runs git and gh in app-owned clones, and optionally copies drafts to iCloud Drive. Across the network, the clones fetch from and push post branches to the GitHub repository, where a pull request merges post/slug into main, and your host deploys main to the live site.</desc>
+  <desc id="desc">The mdwriter app on your Mac has a Rune UI, drawn on the GPU, that runs a Rust backend on worker threads. The backend reads and writes the app data folder, runs git and gh in app-owned clones, and optionally copies drafts to iCloud Drive. Across the network, the clones fetch from and push post branches to the GitHub repository, where a pull request merges post/slug into main, and your host deploys main to the live site.</desc>
   <style>
     .bg { fill: #ffffff; }
     .panel { fill: #f6f8fa; stroke: #d0d7de; }
@@ -51,17 +51,17 @@
   <text class="t h accent" x="64" y="91">mdwriter.app</text>
 
   <rect class="box" x="64" y="106" width="340" height="90" rx="8"/>
-  <text class="t h" x="84" y="132">Webview<tspan class="t s" dx="10">React + CodeMirror</tspan></text>
+  <text class="t h" x="84" y="132">Rune UI<tspan class="t s" dx="10">GPU-rendered, in Rust</tspan></text>
   <text class="t s" x="84" y="158">Editor, live preview, diffs,</text>
   <text class="t s" x="84" y="178">change markers, command palette</text>
 
   <rect class="box" x="556" y="106" width="340" height="90" rx="8"/>
   <text class="t h" x="576" y="132">Rust backend</text>
-  <text class="m" x="576" y="158">src-tauri/src/lib.rs</text>
+  <text class="m" x="576" y="158">src/backend.rs</text>
   <text class="t s" x="576" y="178">git logic in <tspan class="m">sync.rs</tspan></text>
 
   <path class="arrow" d="M408 138 H550" marker-end="url(#a)"/>
-  <text class="t label" x="480" y="130" text-anchor="middle">Tauri commands</text>
+  <text class="t label" x="480" y="130" text-anchor="middle">worker threads</text>
   <path class="arrow" d="M552 166 H410" marker-end="url(#a)"/>
   <text class="t label" x="480" y="184" text-anchor="middle">results</text>
 
